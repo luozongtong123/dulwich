@@ -1,6 +1,6 @@
 # repo.py -- For dealing with git repositories.
 # Copyright (C) 2007 James Westby <jw+debian@jameswestby.net>
-# Copyright (C) 2008-2013 Jelmer Vernooij <jelmer@samba.org>
+# Copyright (C) 2008-2009 Jelmer Vernooij <jelmer@samba.org>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -27,10 +27,9 @@ local disk (Repo).
 
 """
 
-from io import BytesIO
+from cStringIO import StringIO
 import errno
 import os
-import sys
 
 from dulwich.errors import (
     NoIndexPresent,
@@ -39,50 +38,39 @@ from dulwich.errors import (
     NotGitRepository,
     NotTreeError,
     NotTagError,
+    PackedRefsException,
     CommitError,
     RefFormatError,
     HookError,
     )
 from dulwich.file import (
+    ensure_dir_exists,
     GitFile,
     )
 from dulwich.object_store import (
     DiskObjectStore,
     MemoryObjectStore,
-    ObjectStoreGraphWalker,
     )
 from dulwich.objects import (
-    check_hexsha,
     Blob,
     Commit,
     ShaFile,
     Tag,
     Tree,
+    hex_to_sha,
     )
 
 from dulwich.hooks import (
     PreCommitShellHook,
     PostCommitShellHook,
     CommitMsgShellHook,
-    )
-
-from dulwich.refs import (
-    check_ref_format,
-    RefsContainer,
-    DictRefsContainer,
-    InfoRefsContainer,
-    DiskRefsContainer,
-    read_packed_refs,
-    read_packed_refs_with_peeled,
-    write_packed_refs,
-    SYMREF,
-    )
-
+)
 
 import warnings
 
 
 OBJECTDIR = 'objects'
+SYMREF = 'ref: '
 REFSDIR = 'refs'
 REFSDIR_TAGS = 'tags'
 REFSDIR_HEADS = 'heads'
@@ -98,55 +86,718 @@ BASE_DIRECTORIES = [
     ]
 
 
-def parse_graftpoints(graftpoints):
-    """Convert a list of graftpoints into a dict
+def read_info_refs(f):
+    ret = {}
+    for l in f.readlines():
+        (sha, name) = l.rstrip("\r\n").split("\t", 1)
+        ret[name] = sha
+    return ret
 
-    :param graftpoints: Iterator of graftpoint lines
 
-    Each line is formatted as:
-        <commit sha1> <parent sha1> [<parent sha1>]*
+def check_ref_format(refname):
+    """Check if a refname is correctly formatted.
 
-    Resulting dictionary is:
-        <commit sha1>: [<parent sha1>*]
+    Implements all the same rules as git-check-ref-format[1].
 
-    https://git.wiki.kernel.org/index.php/GraftPoint
+    [1] http://www.kernel.org/pub/software/scm/git/docs/git-check-ref-format.html
+
+    :param refname: The refname to check
+    :return: True if refname is valid, False otherwise
     """
-    grafts = {}
-    for l in graftpoints:
-        raw_graft = l.split(None, 1)
+    # These could be combined into one big expression, but are listed separately
+    # to parallel [1].
+    if '/.' in refname or refname.startswith('.'):
+        return False
+    if '/' not in refname:
+        return False
+    if '..' in refname:
+        return False
+    for c in refname:
+        if ord(c) < 040 or c in '\177 ~^:?*[':
+            return False
+    if refname[-1] in '/.':
+        return False
+    if refname.endswith('.lock'):
+        return False
+    if '@{' in refname:
+        return False
+    if '\\' in refname:
+        return False
+    return True
 
-        commit = raw_graft[0]
-        if len(raw_graft) == 2:
-            parents = raw_graft[1].split()
+
+class RefsContainer(object):
+    """A container for refs."""
+
+    def set_ref(self, name, other):
+        warnings.warn("RefsContainer.set_ref() is deprecated."
+            "Use set_symblic_ref instead.",
+            category=DeprecationWarning, stacklevel=2)
+        return self.set_symbolic_ref(name, other)
+
+    def set_symbolic_ref(self, name, other):
+        """Make a ref point at another ref.
+
+        :param name: Name of the ref to set
+        :param other: Name of the ref to point at
+        """
+        raise NotImplementedError(self.set_symbolic_ref)
+
+    def get_packed_refs(self):
+        """Get contents of the packed-refs file.
+
+        :return: Dictionary mapping ref names to SHA1s
+
+        :note: Will return an empty dictionary when no packed-refs file is
+            present.
+        """
+        raise NotImplementedError(self.get_packed_refs)
+
+    def get_peeled(self, name):
+        """Return the cached peeled value of a ref, if available.
+
+        :param name: Name of the ref to peel
+        :return: The peeled value of the ref. If the ref is known not point to a
+            tag, this will be the SHA the ref refers to. If the ref may point to
+            a tag, but no cached information is available, None is returned.
+        """
+        return None
+
+    def import_refs(self, base, other):
+        for name, value in other.iteritems():
+            self["%s/%s" % (base, name)] = value
+
+    def allkeys(self):
+        """All refs present in this container."""
+        raise NotImplementedError(self.allkeys)
+
+    def keys(self, base=None):
+        """Refs present in this container.
+
+        :param base: An optional base to return refs under.
+        :return: An unsorted set of valid refs in this container, including
+            packed refs.
+        """
+        if base is not None:
+            return self.subkeys(base)
         else:
-            parents = []
+            return self.allkeys()
 
-        for sha in [commit] + parents:
-            check_hexsha(sha, 'Invalid graftpoint')
+    def subkeys(self, base):
+        """Refs present in this container under a base.
 
-        grafts[commit] = parents
-    return grafts
+        :param base: The base to return refs under.
+        :return: A set of valid refs in this container under the base; the base
+            prefix is stripped from the ref names returned.
+        """
+        keys = set()
+        base_len = len(base) + 1
+        for refname in self.allkeys():
+            if refname.startswith(base):
+                keys.add(refname[base_len:])
+        return keys
+
+    def as_dict(self, base=None):
+        """Return the contents of this container as a dictionary.
+
+        """
+        ret = {}
+        keys = self.keys(base)
+        if base is None:
+            base = ""
+        for key in keys:
+            try:
+                ret[key] = self[("%s/%s" % (base, key)).strip("/")]
+            except KeyError:
+                continue  # Unable to resolve
+
+        return ret
+
+    def _check_refname(self, name):
+        """Ensure a refname is valid and lives in refs or is HEAD.
+
+        HEAD is not a valid refname according to git-check-ref-format, but this
+        class needs to be able to touch HEAD. Also, check_ref_format expects
+        refnames without the leading 'refs/', but this class requires that
+        so it cannot touch anything outside the refs dir (or HEAD).
+
+        :param name: The name of the reference.
+        :raises KeyError: if a refname is not HEAD or is otherwise not valid.
+        """
+        if name in ('HEAD', 'refs/stash'):
+            return
+        if not name.startswith('refs/') or not check_ref_format(name[5:]):
+            raise RefFormatError(name)
+
+    def read_ref(self, refname):
+        """Read a reference without following any references.
+
+        :param refname: The name of the reference
+        :return: The contents of the ref file, or None if it does
+            not exist.
+        """
+        contents = self.read_loose_ref(refname)
+        if not contents:
+            contents = self.get_packed_refs().get(refname, None)
+        return contents
+
+    def read_loose_ref(self, name):
+        """Read a loose reference and return its contents.
+
+        :param name: the refname to read
+        :return: The contents of the ref file, or None if it does
+            not exist.
+        """
+        raise NotImplementedError(self.read_loose_ref)
+
+    def _follow(self, name):
+        """Follow a reference name.
+
+        :return: a tuple of (refname, sha), where refname is the name of the
+            last reference in the symbolic reference chain
+        """
+        contents = SYMREF + name
+        depth = 0
+        while contents.startswith(SYMREF):
+            refname = contents[len(SYMREF):]
+            contents = self.read_ref(refname)
+            if not contents:
+                break
+            depth += 1
+            if depth > 5:
+                raise KeyError(name)
+        return refname, contents
+
+    def __contains__(self, refname):
+        if self.read_ref(refname):
+            return True
+        return False
+
+    def __getitem__(self, name):
+        """Get the SHA1 for a reference name.
+
+        This method follows all symbolic references.
+        """
+        _, sha = self._follow(name)
+        if sha is None:
+            raise KeyError(name)
+        return sha
+
+    def set_if_equals(self, name, old_ref, new_ref):
+        """Set a refname to new_ref only if it currently equals old_ref.
+
+        This method follows all symbolic references if applicable for the
+        subclass, and can be used to perform an atomic compare-and-swap
+        operation.
+
+        :param name: The refname to set.
+        :param old_ref: The old sha the refname must refer to, or None to set
+            unconditionally.
+        :param new_ref: The new sha the refname will refer to.
+        :return: True if the set was successful, False otherwise.
+        """
+        raise NotImplementedError(self.set_if_equals)
+
+    def add_if_new(self, name, ref):
+        """Add a new reference only if it does not already exist."""
+        raise NotImplementedError(self.add_if_new)
+
+    def __setitem__(self, name, ref):
+        """Set a reference name to point to the given SHA1.
+
+        This method follows all symbolic references if applicable for the
+        subclass.
+
+        :note: This method unconditionally overwrites the contents of a
+            reference. To update atomically only if the reference has not
+            changed, use set_if_equals().
+        :param name: The refname to set.
+        :param ref: The new sha the refname will refer to.
+        """
+        self.set_if_equals(name, None, ref)
+
+    def remove_if_equals(self, name, old_ref):
+        """Remove a refname only if it currently equals old_ref.
+
+        This method does not follow symbolic references, even if applicable for
+        the subclass. It can be used to perform an atomic compare-and-delete
+        operation.
+
+        :param name: The refname to delete.
+        :param old_ref: The old sha the refname must refer to, or None to delete
+            unconditionally.
+        :return: True if the delete was successful, False otherwise.
+        """
+        raise NotImplementedError(self.remove_if_equals)
+
+    def __delitem__(self, name):
+        """Remove a refname.
+
+        This method does not follow symbolic references, even if applicable for
+        the subclass.
+
+        :note: This method unconditionally deletes the contents of a reference.
+            To delete atomically only if the reference has not changed, use
+            remove_if_equals().
+
+        :param name: The refname to delete.
+        """
+        self.remove_if_equals(name, None)
 
 
-def serialize_graftpoints(graftpoints):
-    """Convert a dictionary of grafts into string
+class DictRefsContainer(RefsContainer):
+    """RefsContainer backed by a simple dict.
 
-    The graft dictionary is:
-        <commit sha1>: [<parent sha1>*]
-
-    Each line is formatted as:
-        <commit sha1> <parent sha1> [<parent sha1>]*
-
-    https://git.wiki.kernel.org/index.php/GraftPoint
-
+    This container does not support symbolic or packed references and is not
+    threadsafe.
     """
-    graft_lines = []
-    for commit, parents in graftpoints.items():
-        if parents:
-            graft_lines.append(commit + b' ' + b' '.join(parents))
+
+    def __init__(self, refs):
+        self._refs = refs
+        self._peeled = {}
+
+    def allkeys(self):
+        return self._refs.keys()
+
+    def read_loose_ref(self, name):
+        return self._refs.get(name, None)
+
+    def get_packed_refs(self):
+        return {}
+
+    def set_symbolic_ref(self, name, other):
+        self._refs[name] = SYMREF + other
+
+    def set_if_equals(self, name, old_ref, new_ref):
+        if old_ref is not None and self._refs.get(name, None) != old_ref:
+            return False
+        realname, _ = self._follow(name)
+        self._check_refname(realname)
+        self._refs[realname] = new_ref
+        return True
+
+    def add_if_new(self, name, ref):
+        if name in self._refs:
+            return False
+        self._refs[name] = ref
+        return True
+
+    def remove_if_equals(self, name, old_ref):
+        if old_ref is not None and self._refs.get(name, None) != old_ref:
+            return False
+        del self._refs[name]
+        return True
+
+    def get_peeled(self, name):
+        return self._peeled.get(name)
+
+    def _update(self, refs):
+        """Update multiple refs; intended only for testing."""
+        # TODO(dborowitz): replace this with a public function that uses
+        # set_if_equal.
+        self._refs.update(refs)
+
+    def _update_peeled(self, peeled):
+        """Update cached peeled refs; intended only for testing."""
+        self._peeled.update(peeled)
+
+
+class InfoRefsContainer(RefsContainer):
+    """Refs container that reads refs from a info/refs file."""
+
+    def __init__(self, f):
+        self._refs = {}
+        self._peeled = {}
+        for l in f.readlines():
+            sha, name = l.rstrip("\n").split("\t")
+            if name.endswith("^{}"):
+                name = name[:-3]
+                if not check_ref_format(name):
+                    raise ValueError("invalid ref name '%s'" % name)
+                self._peeled[name] = sha
+            else:
+                if not check_ref_format(name):
+                    raise ValueError("invalid ref name '%s'" % name)
+                self._refs[name] = sha
+
+    def allkeys(self):
+        return self._refs.keys()
+
+    def read_loose_ref(self, name):
+        return self._refs.get(name, None)
+
+    def get_packed_refs(self):
+        return {}
+
+    def get_peeled(self, name):
+        try:
+            return self._peeled[name]
+        except KeyError:
+            return self._refs[name]
+
+
+class DiskRefsContainer(RefsContainer):
+    """Refs container that reads refs from disk."""
+
+    def __init__(self, path):
+        self.path = path
+        self._packed_refs = None
+        self._peeled_refs = None
+
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.path)
+
+    def subkeys(self, base):
+        keys = set()
+        path = self.refpath(base)
+        for root, dirs, files in os.walk(path):
+            dir = root[len(path):].strip(os.path.sep).replace(os.path.sep, "/")
+            for filename in files:
+                refname = ("%s/%s" % (dir, filename)).strip("/")
+                # check_ref_format requires at least one /, so we prepend the
+                # base before calling it.
+                if check_ref_format("%s/%s" % (base, refname)):
+                    keys.add(refname)
+        for key in self.get_packed_refs():
+            if key.startswith(base):
+                keys.add(key[len(base):].strip("/"))
+        return keys
+
+    def allkeys(self):
+        keys = set()
+        if os.path.exists(self.refpath("HEAD")):
+            keys.add("HEAD")
+        path = self.refpath("")
+        for root, dirs, files in os.walk(self.refpath("refs")):
+            dir = root[len(path):].strip(os.path.sep).replace(os.path.sep, "/")
+            for filename in files:
+                refname = ("%s/%s" % (dir, filename)).strip("/")
+                if check_ref_format(refname):
+                    keys.add(refname)
+        keys.update(self.get_packed_refs())
+        return keys
+
+    def refpath(self, name):
+        """Return the disk path of a ref.
+
+        """
+        if os.path.sep != "/":
+            name = name.replace("/", os.path.sep)
+        return os.path.join(self.path, name)
+
+    def get_packed_refs(self):
+        """Get contents of the packed-refs file.
+
+        :return: Dictionary mapping ref names to SHA1s
+
+        :note: Will return an empty dictionary when no packed-refs file is
+            present.
+        """
+        # TODO: invalidate the cache on repacking
+        if self._packed_refs is None:
+            # set both to empty because we want _peeled_refs to be
+            # None if and only if _packed_refs is also None.
+            self._packed_refs = {}
+            self._peeled_refs = {}
+            path = os.path.join(self.path, 'packed-refs')
+            try:
+                f = GitFile(path, 'rb')
+            except IOError, e:
+                if e.errno == errno.ENOENT:
+                    return {}
+                raise
+            try:
+                first_line = iter(f).next().rstrip()
+                if (first_line.startswith("# pack-refs") and " peeled" in
+                        first_line):
+                    for sha, name, peeled in read_packed_refs_with_peeled(f):
+                        self._packed_refs[name] = sha
+                        if peeled:
+                            self._peeled_refs[name] = peeled
+                else:
+                    f.seek(0)
+                    for sha, name in read_packed_refs(f):
+                        self._packed_refs[name] = sha
+            finally:
+                f.close()
+        return self._packed_refs
+
+    def get_peeled(self, name):
+        """Return the cached peeled value of a ref, if available.
+
+        :param name: Name of the ref to peel
+        :return: The peeled value of the ref. If the ref is known not point to a
+            tag, this will be the SHA the ref refers to. If the ref may point to
+            a tag, but no cached information is available, None is returned.
+        """
+        self.get_packed_refs()
+        if self._peeled_refs is None or name not in self._packed_refs:
+            # No cache: no peeled refs were read, or this ref is loose
+            return None
+        if name in self._peeled_refs:
+            return self._peeled_refs[name]
         else:
-            graft_lines.append(commit)
-    return b'\n'.join(graft_lines)
+            # Known not peelable
+            return self[name]
+
+    def read_loose_ref(self, name):
+        """Read a reference file and return its contents.
+
+        If the reference file a symbolic reference, only read the first line of
+        the file. Otherwise, only read the first 40 bytes.
+
+        :param name: the refname to read, relative to refpath
+        :return: The contents of the ref file, or None if the file does not
+            exist.
+        :raises IOError: if any other error occurs
+        """
+        filename = self.refpath(name)
+        try:
+            f = GitFile(filename, 'rb')
+            try:
+                header = f.read(len(SYMREF))
+                if header == SYMREF:
+                    # Read only the first line
+                    return header + iter(f).next().rstrip("\r\n")
+                else:
+                    # Read only the first 40 bytes
+                    return header + f.read(40 - len(SYMREF))
+            finally:
+                f.close()
+        except IOError, e:
+            if e.errno == errno.ENOENT:
+                return None
+            raise
+
+    def _remove_packed_ref(self, name):
+        if self._packed_refs is None:
+            return
+        filename = os.path.join(self.path, 'packed-refs')
+        # reread cached refs from disk, while holding the lock
+        f = GitFile(filename, 'wb')
+        try:
+            self._packed_refs = None
+            self.get_packed_refs()
+
+            if name not in self._packed_refs:
+                return
+
+            del self._packed_refs[name]
+            if name in self._peeled_refs:
+                del self._peeled_refs[name]
+            write_packed_refs(f, self._packed_refs, self._peeled_refs)
+            f.close()
+        finally:
+            f.abort()
+
+    def set_symbolic_ref(self, name, other):
+        """Make a ref point at another ref.
+
+        :param name: Name of the ref to set
+        :param other: Name of the ref to point at
+        """
+        self._check_refname(name)
+        self._check_refname(other)
+        filename = self.refpath(name)
+        try:
+            f = GitFile(filename, 'wb')
+            try:
+                f.write(SYMREF + other + '\n')
+            except (IOError, OSError):
+                f.abort()
+                raise
+        finally:
+            f.close()
+
+    def set_if_equals(self, name, old_ref, new_ref):
+        """Set a refname to new_ref only if it currently equals old_ref.
+
+        This method follows all symbolic references, and can be used to perform
+        an atomic compare-and-swap operation.
+
+        :param name: The refname to set.
+        :param old_ref: The old sha the refname must refer to, or None to set
+            unconditionally.
+        :param new_ref: The new sha the refname will refer to.
+        :return: True if the set was successful, False otherwise.
+        """
+        self._check_refname(name)
+        try:
+            realname, _ = self._follow(name)
+        except KeyError:
+            realname = name
+        filename = self.refpath(realname)
+        ensure_dir_exists(os.path.dirname(filename))
+        f = GitFile(filename, 'wb')
+        try:
+            if old_ref is not None:
+                try:
+                    # read again while holding the lock
+                    orig_ref = self.read_loose_ref(realname)
+                    if orig_ref is None:
+                        orig_ref = self.get_packed_refs().get(realname, None)
+                    if orig_ref != old_ref:
+                        f.abort()
+                        return False
+                except (OSError, IOError):
+                    f.abort()
+                    raise
+            try:
+                f.write(new_ref + "\n")
+            except (OSError, IOError):
+                f.abort()
+                raise
+        finally:
+            f.close()
+        return True
+
+    def add_if_new(self, name, ref):
+        """Add a new reference only if it does not already exist.
+
+        This method follows symrefs, and only ensures that the last ref in the
+        chain does not exist.
+
+        :param name: The refname to set.
+        :param ref: The new sha the refname will refer to.
+        :return: True if the add was successful, False otherwise.
+        """
+        try:
+            realname, contents = self._follow(name)
+            if contents is not None:
+                return False
+        except KeyError:
+            realname = name
+        self._check_refname(realname)
+        filename = self.refpath(realname)
+        ensure_dir_exists(os.path.dirname(filename))
+        f = GitFile(filename, 'wb')
+        try:
+            if os.path.exists(filename) or name in self.get_packed_refs():
+                f.abort()
+                return False
+            try:
+                f.write(ref + "\n")
+            except (OSError, IOError):
+                f.abort()
+                raise
+        finally:
+            f.close()
+        return True
+
+    def remove_if_equals(self, name, old_ref):
+        """Remove a refname only if it currently equals old_ref.
+
+        This method does not follow symbolic references. It can be used to
+        perform an atomic compare-and-delete operation.
+
+        :param name: The refname to delete.
+        :param old_ref: The old sha the refname must refer to, or None to delete
+            unconditionally.
+        :return: True if the delete was successful, False otherwise.
+        """
+        self._check_refname(name)
+        filename = self.refpath(name)
+        ensure_dir_exists(os.path.dirname(filename))
+        f = GitFile(filename, 'wb')
+        try:
+            if old_ref is not None:
+                orig_ref = self.read_loose_ref(name)
+                if orig_ref is None:
+                    orig_ref = self.get_packed_refs().get(name, None)
+                if orig_ref != old_ref:
+                    return False
+            # may only be packed
+            try:
+                os.remove(filename)
+            except OSError, e:
+                if e.errno != errno.ENOENT:
+                    raise
+            self._remove_packed_ref(name)
+        finally:
+            # never write, we just wanted the lock
+            f.abort()
+        return True
+
+
+def _split_ref_line(line):
+    """Split a single ref line into a tuple of SHA1 and name."""
+    fields = line.rstrip("\n").split(" ")
+    if len(fields) != 2:
+        raise PackedRefsException("invalid ref line '%s'" % line)
+    sha, name = fields
+    try:
+        hex_to_sha(sha)
+    except (AssertionError, TypeError), e:
+        raise PackedRefsException(e)
+    if not check_ref_format(name):
+        raise PackedRefsException("invalid ref name '%s'" % name)
+    return (sha, name)
+
+
+def read_packed_refs(f):
+    """Read a packed refs file.
+
+    :param f: file-like object to read from
+    :return: Iterator over tuples with SHA1s and ref names.
+    """
+    for l in f:
+        if l[0] == "#":
+            # Comment
+            continue
+        if l[0] == "^":
+            raise PackedRefsException(
+              "found peeled ref in packed-refs without peeled")
+        yield _split_ref_line(l)
+
+
+def read_packed_refs_with_peeled(f):
+    """Read a packed refs file including peeled refs.
+
+    Assumes the "# pack-refs with: peeled" line was already read. Yields tuples
+    with ref names, SHA1s, and peeled SHA1s (or None).
+
+    :param f: file-like object to read from, seek'ed to the second line
+    """
+    last = None
+    for l in f:
+        if l[0] == "#":
+            continue
+        l = l.rstrip("\r\n")
+        if l[0] == "^":
+            if not last:
+                raise PackedRefsException("unexpected peeled ref line")
+            try:
+                hex_to_sha(l[1:])
+            except (AssertionError, TypeError), e:
+                raise PackedRefsException(e)
+            sha, name = _split_ref_line(last)
+            last = None
+            yield (sha, name, l[1:])
+        else:
+            if last:
+                sha, name = _split_ref_line(last)
+                yield (sha, name, None)
+            last = l
+    if last:
+        sha, name = _split_ref_line(last)
+        yield (sha, name, None)
+
+
+def write_packed_refs(f, packed_refs, peeled_refs=None):
+    """Write a packed refs file.
+
+    :param f: empty file-like object to write to
+    :param packed_refs: dict of refname to sha of packed refs to write
+    :param peeled_refs: dict of refname to peeled value of sha
+    """
+    if peeled_refs is None:
+        peeled_refs = {}
+    else:
+        f.write('# pack-refs with: peeled\n')
+    for refname in sorted(packed_refs.iterkeys()):
+        f.write('%s %s\n' % (packed_refs[refname], refname))
+        if refname in peeled_refs:
+            f.write('^%s\n' % peeled_refs[refname])
 
 
 class BaseRepo(object):
@@ -170,22 +821,21 @@ class BaseRepo(object):
         self.object_store = object_store
         self.refs = refs
 
-        self._graftpoints = {}
         self.hooks = {}
 
     def _init_files(self, bare):
         """Initialize a default set of named files."""
         from dulwich.config import ConfigFile
-        self._put_named_file('description', b"Unnamed repository")
-        f = BytesIO()
+        self._put_named_file('description', "Unnamed repository")
+        f = StringIO()
         cf = ConfigFile()
-        cf.set(b"core", b"repositoryformatversion", b"0")
-        cf.set(b"core", b"filemode", b"true")
-        cf.set(b"core", b"bare", bare)
-        cf.set(b"core", b"logallrefupdates", True)
+        cf.set("core", "repositoryformatversion", "0")
+        cf.set("core", "filemode", "true")
+        cf.set("core", "bare", str(bare).lower())
+        cf.set("core", "logallrefupdates", "true")
         cf.write_to_file(f)
         self._put_named_file('config', f.getvalue())
-        self._put_named_file(os.path.join('info', 'exclude'), b'')
+        self._put_named_file(os.path.join('info', 'exclude'), '')
 
     def get_named_file(self, path):
         """Get a file from the control dir with a specific name.
@@ -222,13 +872,12 @@ class BaseRepo(object):
         :param determine_wants: Optional function to determine what refs to
             fetch.
         :param progress: Optional progress function
-        :return: The local refs
         """
         if determine_wants is None:
-            determine_wants = target.object_store.determine_wants_all
+            determine_wants = lambda heads: heads.values()
         target.object_store.add_objects(
-            self.fetch_objects(determine_wants, target.get_graph_walker(),
-                               progress))
+          self.fetch_objects(determine_wants, target.get_graph_walker(),
+                             progress))
         return self.get_refs()
 
     def fetch_objects(self, determine_wants, graph_walker, progress,
@@ -247,43 +896,14 @@ class BaseRepo(object):
         :return: iterator over objects, with __len__ implemented
         """
         wants = determine_wants(self.get_refs())
-        if not isinstance(wants, list):
-            raise TypeError("determine_wants() did not return a list")
-
-        shallows = getattr(graph_walker, 'shallow', frozenset())
-        unshallows = getattr(graph_walker, 'unshallow', frozenset())
-
-        if wants == []:
+        if wants is None:
             # TODO(dborowitz): find a way to short-circuit that doesn't change
             # this interface.
-
-            if shallows or unshallows:
-                # Do not send a pack in shallow short-circuit path
-                return None
-
-            return []
-
-        # If the graph walker is set up with an implementation that can
-        # ACK/NAK to the wire, it will write data to the client through
-        # this call as a side-effect.
+            return None
         haves = self.object_store.find_common_revisions(graph_walker)
-
-        # Deal with shallow requests separately because the haves do
-        # not reflect what objects are missing
-        if shallows or unshallows:
-            haves = []  # TODO: filter the haves commits from iter_shas.
-                        # the specific commits aren't missing.
-
-        def get_parents(commit):
-            if commit.id in shallows:
-                return []
-            return self.get_parents(commit.id, commit)
-
         return self.object_store.iter_shas(
-          self.object_store.find_missing_objects(
-              haves, wants, progress,
-              get_tagged,
-              get_parents=get_parents))
+          self.object_store.find_missing_objects(haves, wants, progress,
+                                                 get_tagged))
 
     def get_graph_walker(self, heads=None):
         """Retrieve a graph walker.
@@ -295,8 +915,17 @@ class BaseRepo(object):
         :return: A graph walker object
         """
         if heads is None:
-            heads = self.refs.as_dict(b'refs/heads').values()
-        return ObjectStoreGraphWalker(heads, self.get_parents)
+            heads = self.refs.as_dict('refs/heads').values()
+        return self.object_store.get_graph_walker(heads)
+
+    def ref(self, name):
+        """Return the SHA1 a ref is pointing to.
+
+        :param name: Name of the ref to look up
+        :raise KeyError: when the ref (or the one it points to) does not exist
+        :return: SHA1 it is pointing at
+        """
+        return self.refs[name]
 
     def get_refs(self):
         """Get dictionary with all refs.
@@ -307,7 +936,7 @@ class BaseRepo(object):
 
     def head(self):
         """Return the SHA1 pointed at by HEAD."""
-        return self.refs[b'HEAD']
+        return self.refs['HEAD']
 
     def _get_object(self, sha, cls):
         assert len(sha) in (20, 40)
@@ -335,23 +964,13 @@ class BaseRepo(object):
         """
         return self.object_store[sha]
 
-    def get_parents(self, sha, commit=None):
+    def get_parents(self, sha):
         """Retrieve the parents of a specific commit.
 
-        If the specific commit is a graftpoint, the graft parents
-        will be returned instead.
-
         :param sha: SHA of the commit for which to retrieve the parents
-        :param commit: Optional commit matching the sha
         :return: List of parents
         """
-
-        try:
-            return self._graftpoints[sha]
-        except KeyError:
-            if commit is None:
-                commit = self[sha]
-            return commit.parents
+        return self.commit(sha).parents
 
     def get_config(self):
         """Retrieve the config object.
@@ -368,13 +987,6 @@ class BaseRepo(object):
         """
         raise NotImplementedError(self.get_description)
 
-    def set_description(self, description):
-        """Set the description for this repository.
-
-        :param description: Text to set as description for this repository.
-        """
-        raise NotImplementedError(self.set_description)
-
     def get_config_stack(self):
         """Return a config stack for this repository.
 
@@ -387,6 +999,54 @@ class BaseRepo(object):
         from dulwich.config import StackedConfig
         backends = [self.get_config()] + StackedConfig.default_backends()
         return StackedConfig(backends, writable=backends[0])
+
+    def commit(self, sha):
+        """Retrieve the commit with a particular SHA.
+
+        :param sha: SHA of the commit to retrieve
+        :raise NotCommitError: If the SHA provided doesn't point at a Commit
+        :raise KeyError: If the SHA provided didn't exist
+        :return: A `Commit` object
+        """
+        warnings.warn("Repo.commit(sha) is deprecated. Use Repo[sha] instead.",
+            category=DeprecationWarning, stacklevel=2)
+        return self._get_object(sha, Commit)
+
+    def tree(self, sha):
+        """Retrieve the tree with a particular SHA.
+
+        :param sha: SHA of the tree to retrieve
+        :raise NotTreeError: If the SHA provided doesn't point at a Tree
+        :raise KeyError: If the SHA provided didn't exist
+        :return: A `Tree` object
+        """
+        warnings.warn("Repo.tree(sha) is deprecated. Use Repo[sha] instead.",
+            category=DeprecationWarning, stacklevel=2)
+        return self._get_object(sha, Tree)
+
+    def tag(self, sha):
+        """Retrieve the tag with a particular SHA.
+
+        :param sha: SHA of the tag to retrieve
+        :raise NotTagError: If the SHA provided doesn't point at a Tag
+        :raise KeyError: If the SHA provided didn't exist
+        :return: A `Tag` object
+        """
+        warnings.warn("Repo.tag(sha) is deprecated. Use Repo[sha] instead.",
+            category=DeprecationWarning, stacklevel=2)
+        return self._get_object(sha, Tag)
+
+    def get_blob(self, sha):
+        """Retrieve the blob with a particular SHA.
+
+        :param sha: SHA of the blob to retrieve
+        :raise NotBlobError: If the SHA provided doesn't point at a Blob
+        :raise KeyError: If the SHA provided didn't exist
+        :return: A `Blob` object
+        """
+        warnings.warn("Repo.get_blob(sha) is deprecated. Use Repo[sha] "
+            "instead.", category=DeprecationWarning, stacklevel=2)
+        return self._get_object(sha, Blob)
 
     def get_peeled(self, ref):
         """Get the peeled value of a ref.
@@ -431,10 +1091,21 @@ class BaseRepo(object):
             include = [self.head()]
         if isinstance(include, str):
             include = [include]
-
-        kwargs['get_parents'] = lambda commit: self.get_parents(commit.id, commit)
-
         return Walker(self.object_store, include, *args, **kwargs)
+
+    def revision_history(self, head):
+        """Returns a list of the commits reachable from head.
+
+        :param head: The SHA of the head to list revision history for.
+        :return: A list of commit objects reachable from head, starting with
+            head itself, in descending commit time order.
+        :raise MissingCommitError: if any missing commits are referenced,
+            including if the head parameter isn't the SHA of a commit.
+        """
+        warnings.warn("Repo.revision_history() is deprecated."
+            "Use dulwich.walker.Walker(repo) instead.",
+            category=DeprecationWarning, stacklevel=2)
+        return [e.commit for e in self.get_walker(include=[head])]
 
     def __getitem__(self, name):
         """Retrieve a Git object by SHA1 or ref.
@@ -443,9 +1114,6 @@ class BaseRepo(object):
         :return: A `ShaFile` object, such as a Commit or Blob
         :raise KeyError: when the specified ref or object does not exist
         """
-        if not isinstance(name, bytes):
-            raise TypeError("'name' must be bytestring, not %.80s" %
-                    type(name).__name__)
         if len(name) in (20, 40):
             try:
                 return self.object_store[name]
@@ -472,10 +1140,10 @@ class BaseRepo(object):
         :param name: ref name
         :param value: Ref value - either a ShaFile object, or a hex sha
         """
-        if name.startswith(b"refs/") or name == b'HEAD':
+        if name.startswith("refs/") or name == "HEAD":
             if isinstance(value, ShaFile):
                 self.refs[name] = value.id
-            elif isinstance(value, bytes):
+            elif isinstance(value, str):
                 self.refs[name] = value
             else:
                 raise TypeError(value)
@@ -487,7 +1155,7 @@ class BaseRepo(object):
 
         :param name: Name of the ref to remove
         """
-        if name.startswith(b"refs/") or name == b"HEAD":
+        if name.startswith("refs/") or name == "HEAD":
             del self.refs[name]
         else:
             raise ValueError(name)
@@ -496,35 +1164,15 @@ class BaseRepo(object):
         """Determine the identity to use for new commits.
         """
         config = self.get_config_stack()
-        return (config.get((b"user", ), b"name") + b" <" +
-                config.get((b"user", ), b"email") + b">")
-
-    def _add_graftpoints(self, updated_graftpoints):
-        """Add or modify graftpoints
-
-        :param updated_graftpoints: Dict of commit shas to list of parent shas
-        """
-
-        # Simple validation
-        for commit, parents in updated_graftpoints.items():
-            for sha in [commit] + parents:
-                check_hexsha(sha, 'Invalid graftpoint')
-
-        self._graftpoints.update(updated_graftpoints)
-
-    def _remove_graftpoints(self, to_remove=[]):
-        """Remove graftpoints
-
-        :param to_remove: List of commit shas
-        """
-        for sha in to_remove:
-            del self._graftpoints[sha]
+        return "%s <%s>" % (
+            config.get(("user", ), "name"),
+            config.get(("user", ), "email"))
 
     def do_commit(self, message=None, committer=None,
                   author=None, commit_timestamp=None,
                   commit_timezone=None, author_timestamp=None,
                   author_timezone=None, tree=None, encoding=None,
-                  ref=b'HEAD', merge_heads=None):
+                  ref='HEAD', merge_heads=None):
         """Create a new commit.
 
         :param message: Commit message
@@ -554,7 +1202,7 @@ class BaseRepo(object):
 
         try:
             self.hooks['pre-commit'].execute()
-        except HookError as e:
+        except HookError, e:
             raise CommitError(e)
         except KeyError:  # no hook defined, silent fallthrough
             pass
@@ -563,12 +1211,9 @@ class BaseRepo(object):
             # FIXME: Read merge heads from .git/MERGE_HEADS
             merge_heads = []
         if committer is None:
-            # FIXME: Support GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL environment
-            # variables
             committer = self._get_user_identity()
         c.committer = committer
         if commit_timestamp is None:
-            # FIXME: Support GIT_COMMITTER_DATE environment variable
             commit_timestamp = time.time()
         c.commit_time = int(commit_timestamp)
         if commit_timezone is None:
@@ -576,12 +1221,9 @@ class BaseRepo(object):
             commit_timezone = 0
         c.commit_timezone = commit_timezone
         if author is None:
-            # FIXME: Support GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL environment
-            # variables
             author = committer
         c.author = author
         if author_timestamp is None:
-            # FIXME: Support GIT_AUTHOR_DATE environment variable
             author_timestamp = commit_timestamp
         c.author_time = int(author_timestamp)
         if author_timezone is None:
@@ -597,33 +1239,28 @@ class BaseRepo(object):
             c.message = self.hooks['commit-msg'].execute(message)
             if c.message is None:
                 c.message = message
-        except HookError as e:
+        except HookError, e:
             raise CommitError(e)
         except KeyError:  # no hook defined, message not modified
             c.message = message
 
-        if ref is None:
-            # Create a dangling commit
+        try:
+            old_head = self.refs[ref]
+            c.parents = [old_head] + merge_heads
+            self.object_store.add_object(c)
+            ok = self.refs.set_if_equals(ref, old_head, c.id)
+        except KeyError:
             c.parents = merge_heads
             self.object_store.add_object(c)
-        else:
-            try:
-                old_head = self.refs[ref]
-                c.parents = [old_head] + merge_heads
-                self.object_store.add_object(c)
-                ok = self.refs.set_if_equals(ref, old_head, c.id)
-            except KeyError:
-                c.parents = merge_heads
-                self.object_store.add_object(c)
-                ok = self.refs.add_if_new(ref, c.id)
-            if not ok:
-                # Fail if the atomic compare-and-swap failed, leaving the commit and
-                # all its objects as garbage.
-                raise CommitError("%s changed during commit" % (ref,))
+            ok = self.refs.add_if_new(ref, c.id)
+        if not ok:
+            # Fail if the atomic compare-and-swap failed, leaving the commit and
+            # all its objects as garbage.
+            raise CommitError("%s changed during commit" % (ref,))
 
         try:
             self.hooks['post-commit'].execute()
-        except HookError as e:  # silent failure
+        except HookError, e:  # silent failure
             warnings.warn("post-commit hook failed: %s" % e, UserWarning)
         except KeyError:  # no hook defined, silent fallthrough
             pass
@@ -650,8 +1287,11 @@ class Repo(BaseRepo):
             self._controldir = root
         elif (os.path.isfile(os.path.join(root, ".git"))):
             import re
-            with open(os.path.join(root, ".git"), 'r') as f:
+            f = open(os.path.join(root, ".git"), 'r')
+            try:
                 _, path = re.match('(gitdir: )(.+$)', f.read()).groups()
+            finally:
+                f.close()
             self.bare = False
             self._controldir = os.path.join(root, path)
         else:
@@ -664,39 +1304,9 @@ class Repo(BaseRepo):
         refs = DiskRefsContainer(self.controldir())
         BaseRepo.__init__(self, object_store, refs)
 
-        self._graftpoints = {}
-        graft_file = self.get_named_file(os.path.join("info", "grafts"))
-        if graft_file:
-            with graft_file:
-                self._graftpoints.update(parse_graftpoints(graft_file))
-        graft_file = self.get_named_file("shallow")
-        if graft_file:
-            with graft_file:
-                self._graftpoints.update(parse_graftpoints(graft_file))
-
         self.hooks['pre-commit'] = PreCommitShellHook(self.controldir())
         self.hooks['commit-msg'] = CommitMsgShellHook(self.controldir())
         self.hooks['post-commit'] = PostCommitShellHook(self.controldir())
-
-    @classmethod
-    def discover(cls, start='.'):
-        """Iterate parent directories to discover a repository
-
-        Return a Repo object for the first parent directory that looks like a
-        Git repository.
-
-        :param start: The directory to start discovery from (defaults to '.')
-        """
-        remaining = True
-        path = os.path.abspath(start)
-        while remaining:
-            try:
-                return cls(path)
-            except NotGitRepository:
-                path, remaining = os.path.split(path)
-        raise NotGitRepository(
-            "No git repository was found at %(path)s" % dict(path=start)
-        )
 
     def controldir(self):
         """Return the path of the control directory."""
@@ -709,8 +1319,11 @@ class Repo(BaseRepo):
         :param contents: A string to write to the file.
         """
         path = path.lstrip(os.path.sep)
-        with GitFile(os.path.join(self.controldir(), path), 'wb') as f:
+        f = GitFile(os.path.join(self.controldir(), path), 'wb')
+        try:
             f.write(contents)
+        finally:
+            f.close()
 
     def get_named_file(self, path):
         """Get a file from the control dir with a specific name.
@@ -727,7 +1340,7 @@ class Repo(BaseRepo):
         path = path.lstrip(os.path.sep)
         try:
             return open(os.path.join(self.controldir(), path), 'rb')
-        except (IOError, OSError) as e:
+        except (IOError, OSError), e:
             if e.errno == errno.ENOENT:
                 return None
             raise
@@ -753,43 +1366,38 @@ class Repo(BaseRepo):
         # missing index file, which is treated as empty.
         return not self.bare
 
-    def stage(self, fs_paths):
+    def stage(self, paths):
         """Stage a set of paths.
 
-        :param fs_paths: List of paths, relative to the repository path
+        :param paths: List of paths, relative to the repository path
         """
-
-        root_path_bytes = self.path.encode(sys.getfilesystemencoding())
-
-        if not isinstance(fs_paths, list):
-            fs_paths = [fs_paths]
-        from dulwich.index import (
-            blob_from_path_and_stat,
-            index_entry_from_stat,
-            _fs_to_tree_path,
-            )
+        if isinstance(paths, basestring):
+            paths = [paths]
+        from dulwich.index import index_entry_from_stat
         index = self.open_index()
-        for fs_path in fs_paths:
-            if not isinstance(fs_path, bytes):
-                fs_path = fs_path.encode(sys.getfilesystemencoding())
-            tree_path = _fs_to_tree_path(fs_path)
-            full_path = os.path.join(root_path_bytes, fs_path)
+        for path in paths:
+            full_path = os.path.join(self.path, path)
             try:
-                st = os.lstat(full_path)
+                st = os.stat(full_path)
             except OSError:
                 # File no longer exists
                 try:
-                    del index[tree_path]
+                    del index[path]
                 except KeyError:
                     pass  # already removed
             else:
-                blob = blob_from_path_and_stat(full_path, st)
+                blob = Blob()
+                f = open(full_path, 'rb')
+                try:
+                    blob.data = f.read()
+                finally:
+                    f.close()
                 self.object_store.add_object(blob)
-                index[tree_path] = index_entry_from_stat(st, blob.id, 0)
+                index[path] = index_entry_from_stat(st, blob.id, 0)
         index.write()
 
     def clone(self, target_path, mkdir=True, bare=False,
-            origin=b"origin"):
+            origin="origin"):
         """Clone this repository.
 
         :param target_path: Target path
@@ -805,49 +1413,35 @@ class Repo(BaseRepo):
             target = self.init_bare(target_path)
         self.fetch(target)
         target.refs.import_refs(
-            b'refs/remotes/' + origin, self.refs.as_dict(b'refs/heads'))
+            'refs/remotes/' + origin, self.refs.as_dict('refs/heads'))
         target.refs.import_refs(
-            b'refs/tags', self.refs.as_dict(b'refs/tags'))
+            'refs/tags', self.refs.as_dict('refs/tags'))
         try:
             target.refs.add_if_new(
-                b'refs/heads/master',
-                self.refs[b'refs/heads/master'])
+                'refs/heads/master',
+                self.refs['refs/heads/master'])
         except KeyError:
             pass
 
         # Update target head
-        head, head_sha = self.refs._follow(b'HEAD')
+        head, head_sha = self.refs._follow('HEAD')
         if head is not None and head_sha is not None:
-            target.refs.set_symbolic_ref(b'HEAD', head)
-            target[b'HEAD'] = head_sha
+            target.refs.set_symbolic_ref('HEAD', head)
+            target['HEAD'] = head_sha
 
             if not bare:
                 # Checkout HEAD to target dir
-                target.reset_index()
+                target._build_tree()
 
         return target
 
-    def reset_index(self, tree=None):
-        """Reset the index back to a specific tree.
-
-        :param tree: Tree SHA to reset to, None for current HEAD tree.
-        """
-        from dulwich.index import (
-            build_index_from_tree,
-            validate_path_element_default,
-            validate_path_element_ntfs,
-            )
-        if tree is None:
-            tree = self[b'HEAD'].tree
+    def _build_tree(self):
+        from dulwich.index import build_index_from_tree
         config = self.get_config()
         honor_filemode = config.get_boolean('core', 'filemode', os.name != "nt")
-        if config.get_boolean('core', 'core.protectNTFS', os.name == "nt"):
-            validate_path_element = validate_path_element_ntfs
-        else:
-            validate_path_element = validate_path_element_default
         return build_index_from_tree(self.path, self.index_path(),
-                self.object_store, tree, honor_filemode=honor_filemode,
-                validate_path_element=validate_path_element)
+                self.object_store, self['HEAD'].tree,
+                honor_filemode=honor_filemode)
 
     def get_config(self):
         """Retrieve the config object.
@@ -858,7 +1452,7 @@ class Repo(BaseRepo):
         path = os.path.join(self._controldir, 'config')
         try:
             return ConfigFile.from_path(path)
-        except (IOError, OSError) as e:
+        except (IOError, OSError), e:
             if e.errno != errno.ENOENT:
                 raise
             ret = ConfigFile()
@@ -872,9 +1466,12 @@ class Repo(BaseRepo):
         """
         path = os.path.join(self._controldir, 'description')
         try:
-            with GitFile(path, 'rb') as f:
+            f = GitFile(path, 'rb')
+            try:
                 return f.read()
-        except (IOError, OSError) as e:
+            finally:
+                f.close()
+        except (IOError, OSError), e:
             if e.errno != errno.ENOENT:
                 raise
             return None
@@ -882,21 +1479,13 @@ class Repo(BaseRepo):
     def __repr__(self):
         return "<Repo at %r>" % self.path
 
-    def set_description(self, description):
-        """Set the description for this repository.
-
-        :param description: Text to set as description for this repository.
-        """
-
-        self._put_named_file('description', description)
-
     @classmethod
     def _init_maybe_bare(cls, path, bare):
         for d in BASE_DIRECTORIES:
             os.mkdir(os.path.join(path, *d))
         DiskObjectStore.init(os.path.join(path, OBJECTDIR))
         ret = cls(path)
-        ret.refs.set_symbolic_ref(b'HEAD', b"refs/heads/master")
+        ret.refs.set_symbolic_ref("HEAD", "refs/heads/master")
         ret._init_files(bare)
         return ret
 
@@ -928,10 +1517,6 @@ class Repo(BaseRepo):
 
     create = init_bare
 
-    def close(self):
-        """Close any files opened by this repository."""
-        self.object_store.close()
-
 
 class MemoryRepo(BaseRepo):
     """Repo that stores refs, objects, and named files in memory.
@@ -941,11 +1526,9 @@ class MemoryRepo(BaseRepo):
     """
 
     def __init__(self):
-        from dulwich.config import ConfigFile
         BaseRepo.__init__(self, MemoryObjectStore(), DictRefsContainer({}))
         self._named_files = {}
         self.bare = True
-        self._config = ConfigFile()
 
     def _put_named_file(self, path, contents):
         """Write a file to the control dir with the given name and contents.
@@ -968,7 +1551,7 @@ class MemoryRepo(BaseRepo):
         contents = self._named_files.get(path, None)
         if contents is None:
             return None
-        return BytesIO(contents)
+        return StringIO(contents)
 
     def open_index(self):
         """Fail to open index for this repo, since it is bare.
@@ -982,7 +1565,8 @@ class MemoryRepo(BaseRepo):
 
         :return: `ConfigFile` object.
         """
-        return self._config
+        from dulwich.config import ConfigFile
+        return ConfigFile()
 
     def get_description(self):
         """Retrieve the repository description.
@@ -1003,7 +1587,7 @@ class MemoryRepo(BaseRepo):
         ret = cls()
         for obj in objects:
             ret.object_store.add_object(obj)
-        for refname, sha in refs.items():
+        for refname, sha in refs.iteritems():
             ret.refs[refname] = sha
         ret._init_files(bare=True)
         return ret

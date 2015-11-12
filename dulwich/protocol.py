@@ -1,6 +1,6 @@
 # protocol.py -- Shared parts of the git protocols
 # Copyright (C) 2008 John Carr <john.carr@unrouted.co.uk>
-# Copyright (C) 2008-2012 Jelmer Vernooij <jelmer@samba.org>
+# Copyright (C) 2008 Jelmer Vernooij <jelmer@samba.org>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -19,62 +19,24 @@
 
 """Generic functions for talking the git smart server protocol."""
 
-from io import BytesIO
-from os import (
-    SEEK_END,
-    )
+from cStringIO import StringIO
 import socket
 
-import dulwich
 from dulwich.errors import (
     HangupException,
     GitProtocolError,
     )
+from dulwich._compat import (
+    SEEK_END,
+    )
 
 TCP_GIT_PORT = 9418
 
-ZERO_SHA = b"0" * 40
+ZERO_SHA = "0" * 40
 
 SINGLE_ACK = 0
 MULTI_ACK = 1
 MULTI_ACK_DETAILED = 2
-
-# pack data
-SIDE_BAND_CHANNEL_DATA = 1
-# progress messages
-SIDE_BAND_CHANNEL_PROGRESS = 2
-# fatal error message just before stream aborts
-SIDE_BAND_CHANNEL_FATAL = 3
-
-CAPABILITY_DELETE_REFS = b'delete-refs'
-CAPABILITY_INCLUDE_TAG = b'include-tag'
-CAPABILITY_MULTI_ACK = b'multi_ack'
-CAPABILITY_MULTI_ACK_DETAILED = b'multi_ack_detailed'
-CAPABILITY_NO_DONE = b'no-done'
-CAPABILITY_NO_PROGRESS = b'no-progress'
-CAPABILITY_OFS_DELTA = b'ofs-delta'
-CAPABILITY_QUIET = b'quiet'
-CAPABILITY_REPORT_STATUS = b'report-status'
-CAPABILITY_SHALLOW = b'shallow'
-CAPABILITY_SIDE_BAND_64K = b'side-band-64k'
-CAPABILITY_THIN_PACK = b'thin-pack'
-CAPABILITY_AGENT = b'agent'
-
-
-def agent_string():
-    return ('dulwich/%d.%d.%d' % dulwich.__version__).encode('ascii')
-
-
-def capability_agent():
-    return CAPABILITY_AGENT + b'=' + agent_string()
-
-
-COMMAND_DEEPEN = b'deepen'
-COMMAND_SHALLOW = b'shallow'
-COMMAND_UNSHALLOW = b'unshallow'
-COMMAND_DONE = b'done'
-COMMAND_WANT = b'want'
-COMMAND_HAVE = b'have'
 
 
 class ProtocolFile(object):
@@ -99,8 +61,8 @@ def pkt_line(data):
         None, returns the flush-pkt ('0000').
     """
     if data is None:
-        return b'0000'
-    return ('%04x' % (len(data) + 4)).encode('ascii') + data
+        return '0000'
+    return '%04x%s' % (len(data) + 4, data)
 
 
 class Protocol(object):
@@ -115,22 +77,11 @@ class Protocol(object):
         Documentation/technical/protocol-common.txt
     """
 
-    def __init__(self, read, write, close=None, report_activity=None):
+    def __init__(self, read, write, report_activity=None):
         self.read = read
         self.write = write
-        self._close = close
         self.report_activity = report_activity
         self._readahead = None
-
-    def close(self):
-        if self._close:
-            self._close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
 
     def read_pkt_line(self):
         """Reads a pkt-line from the remote git process.
@@ -157,14 +108,9 @@ class Protocol(object):
                 return None
             if self.report_activity:
                 self.report_activity(size, 'read')
-            pkt_contents = read(size-4)
-        except socket.error as e:
+            return read(size-4)
+        except socket.error, e:
             raise GitProtocolError(e)
-        else:
-            if len(pkt_contents) + 4 != size:
-                raise GitProtocolError(
-                    'Length of pkt read %04x does not match length prefix %04x' % (len(pkt_contents) + 4, size))
-            return pkt_contents
 
     def eof(self):
         """Test whether the protocol stream has reached EOF.
@@ -191,7 +137,7 @@ class Protocol(object):
         """
         if self._readahead is not None:
             raise ValueError('Attempted to unread multiple pkt-lines.')
-        self._readahead = BytesIO(pkt_line(data))
+        self._readahead = StringIO(pkt_line(data))
 
     def read_pkt_seq(self):
         """Read a sequence of pkt-lines from the remote git process.
@@ -214,7 +160,7 @@ class Protocol(object):
             self.write(line)
             if self.report_activity:
                 self.report_activity(len(line), 'write')
-        except socket.error as e:
+        except socket.error, e:
             raise GitProtocolError(e)
 
     def write_file(self):
@@ -248,7 +194,7 @@ class Protocol(object):
         # 65520-5 = 65515
         # WTF: Why have the len in ASCII, but the channel in binary.
         while blob:
-            self.write_pkt_line(bytes(bytearray([channel])) + blob[:65515])
+            self.write_pkt_line("%s%s" % (chr(channel), blob[:65515]))
             blob = blob[65515:]
 
     def send_cmd(self, cmd, *args):
@@ -259,7 +205,7 @@ class Protocol(object):
         :param cmd: The remote service to access.
         :param args: List of arguments to send to remove service.
         """
-        self.write_pkt_line(cmd + b" " + b"".join([(a + b"\0") for a in args]))
+        self.write_pkt_line("%s %s" % (cmd, "".join(["%s\0" % a for a in args])))
 
     def read_cmd(self):
         """Read a command and some arguments from the git client
@@ -269,10 +215,10 @@ class Protocol(object):
         :return: A tuple of (command, [list of arguments]).
         """
         line = self.read_pkt_line()
-        splice_at = line.find(b" ")
+        splice_at = line.find(" ")
         cmd, args = line[:splice_at], line[splice_at+1:]
-        assert args[-1:] == b"\x00"
-        return cmd, args[:-1].split(b"\0")
+        assert args[-1] == "\x00"
+        return cmd, args[:-1].split(chr(0))
 
 
 _RBUFSIZE = 8192  # Default read buffer size.
@@ -294,7 +240,7 @@ class ReceivableProtocol(Protocol):
         super(ReceivableProtocol, self).__init__(self.read, write,
                                                  report_activity)
         self._recv = recv
-        self._rbuf = BytesIO()
+        self._rbuf = StringIO()
         self._rbufsize = rbufsize
 
     def read(self, size):
@@ -306,10 +252,10 @@ class ReceivableProtocol(Protocol):
         #  - use SEEK_END instead of the magic number.
         # Copyright (c) 2001-2010 Python Software Foundation; All Rights Reserved
         # Licensed under the Python Software Foundation License.
-        # TODO: see if buffer is more efficient than cBytesIO.
+        # TODO: see if buffer is more efficient than cStringIO.
         assert size > 0
 
-        # Our use of BytesIO rather than lists of string objects returned by
+        # Our use of StringIO rather than lists of string objects returned by
         # recv() minimizes memory usage and fragmentation that occurs when
         # rbufsize is large compared to the typical return value of recv().
         buf = self._rbuf
@@ -321,18 +267,18 @@ class ReceivableProtocol(Protocol):
             # Already have size bytes in our buffer?  Extract and return.
             buf.seek(start)
             rv = buf.read(size)
-            self._rbuf = BytesIO()
+            self._rbuf = StringIO()
             self._rbuf.write(buf.read())
             self._rbuf.seek(0)
             return rv
 
-        self._rbuf = BytesIO()  # reset _rbuf.  we consume it via buf.
+        self._rbuf = StringIO()  # reset _rbuf.  we consume it via buf.
         while True:
             left = size - buf_len
             # recv() will malloc the amount of memory given as its
             # parameter even though it often returns much less data
             # than that.  The returned data string is short lived
-            # as we copy it into a BytesIO and free it.  This avoids
+            # as we copy it into a StringIO and free it.  This avoids
             # fragmentation issues on many platforms.
             data = self._recv(left)
             if not data:
@@ -373,7 +319,7 @@ class ReceivableProtocol(Protocol):
             if len(data) == size:
                 # shortcut: skip the buffer if we read exactly size bytes
                 return data
-            buf = BytesIO()
+            buf = StringIO()
             buf.write(data)
             buf.seek(0)
             del data  # explicit free
@@ -387,10 +333,10 @@ def extract_capabilities(text):
     :param text: String to extract from
     :return: Tuple with text with capabilities removed and list of capabilities
     """
-    if not b"\0" in text:
+    if not "\0" in text:
         return text, []
-    text, capabilities = text.rstrip().split(b"\0")
-    return (text, capabilities.strip().split(b" "))
+    text, capabilities = text.rstrip().split("\0")
+    return (text, capabilities.strip().split(" "))
 
 
 def extract_want_line_capabilities(text):
@@ -404,17 +350,17 @@ def extract_want_line_capabilities(text):
     :param text: Want line to extract from
     :return: Tuple with text with capabilities removed and list of capabilities
     """
-    split_text = text.rstrip().split(b" ")
+    split_text = text.rstrip().split(" ")
     if len(split_text) < 3:
         return text, []
-    return (b" ".join(split_text[:2]), split_text[2:])
+    return (" ".join(split_text[:2]), split_text[2:])
 
 
 def ack_type(capabilities):
     """Extract the ack type from a capabilities list."""
-    if b'multi_ack_detailed' in capabilities:
+    if 'multi_ack_detailed' in capabilities:
         return MULTI_ACK_DETAILED
-    elif b'multi_ack' in capabilities:
+    elif 'multi_ack' in capabilities:
         return MULTI_ACK
     return SINGLE_ACK
 
@@ -435,7 +381,7 @@ class BufferedPktLineWriter(object):
         """
         self._write = write
         self._bufsize = bufsize
-        self._wbuf = BytesIO()
+        self._wbuf = StringIO()
         self._buflen = 0
 
     def write(self, data):
@@ -459,7 +405,7 @@ class BufferedPktLineWriter(object):
         if data:
             self._write(data)
         self._len = 0
-        self._wbuf = BytesIO()
+        self._wbuf = StringIO()
 
 
 class PktLineParser(object):
@@ -468,7 +414,7 @@ class PktLineParser(object):
 
     def __init__(self, handle_pkt):
         self.handle_pkt = handle_pkt
-        self._readahead = BytesIO()
+        self._readahead = StringIO()
 
     def parse(self, data):
         """Parse a fragment of data and call back for any completed packets.
@@ -487,7 +433,7 @@ class PktLineParser(object):
                 buf = buf[size:]
             else:
                 break
-        self._readahead = BytesIO()
+        self._readahead = StringIO()
         self._readahead.write(buf)
 
     def get_tail(self):

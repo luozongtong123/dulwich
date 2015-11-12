@@ -1,10 +1,10 @@
-# _compat.py -- For dealing with python2.6 oddness
-# Copyright (C) 2012-2014 Jelmer Vernooij and others.
+# _compat.py -- For dealing with python2.4 oddness
+# Copyright (C) 2008 Canonical Ltd.
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
 # as published by the Free Software Foundation; version 2
-# of the License or (at your option) a later version of the License.
+# of the License or (at your option) a later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -16,14 +16,262 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
 # MA  02110-1301, USA.
 
-"""Misc utilities to work with python <2.7.
+"""Misc utilities to work with python <2.6.
 
 These utilities can all be deleted when dulwich decides it wants to stop
-support for python <2.7.
+support for python <2.6.
 """
+try:
+    import hashlib
+except ImportError:
+    import sha
 
-# Backport of OrderedDict() class that runs on Python 2.4, 2.5, 2.6, 2.7 and
-# pypy. Passes Python2.7's test suite and incorporates all the latest updates.
+try:
+    from urlparse import parse_qs
+except ImportError:
+    from cgi import parse_qs
+
+try:
+    from os import SEEK_CUR, SEEK_END
+except ImportError:
+    SEEK_CUR = 1
+    SEEK_END = 2
+
+import struct
+
+
+class defaultdict(dict):
+    """A python 2.4 equivalent of collections.defaultdict."""
+
+    def __init__(self, default_factory=None, *a, **kw):
+        if (default_factory is not None and
+            not hasattr(default_factory, '__call__')):
+            raise TypeError('first argument must be callable')
+        dict.__init__(self, *a, **kw)
+        self.default_factory = default_factory
+
+    def __getitem__(self, key):
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError:
+            return self.__missing__(key)
+
+    def __missing__(self, key):
+        if self.default_factory is None:
+            raise KeyError(key)
+        self[key] = value = self.default_factory()
+        return value
+
+    def __reduce__(self):
+        if self.default_factory is None:
+            args = tuple()
+        else:
+            args = self.default_factory,
+        return type(self), args, None, None, self.items()
+
+    def copy(self):
+        return self.__copy__()
+
+    def __copy__(self):
+        return type(self)(self.default_factory, self)
+
+    def __deepcopy__(self, memo):
+        import copy
+        return type(self)(self.default_factory,
+                          copy.deepcopy(self.items()))
+    def __repr__(self):
+        return 'defaultdict(%s, %s)' % (self.default_factory,
+                                        dict.__repr__(self))
+
+
+def make_sha(source=''):
+    """A python2.4 workaround for the sha/hashlib module fiasco."""
+    try:
+        return hashlib.sha1(source)
+    except NameError:
+        sha1 = sha.sha(source)
+        return sha1
+
+
+def unpack_from(fmt, buf, offset=0):
+    """A python2.4 workaround for struct missing unpack_from."""
+    try:
+        return struct.unpack_from(fmt, buf, offset)
+    except AttributeError:
+        b = buf[offset:offset+struct.calcsize(fmt)]
+        return struct.unpack(fmt, b)
+
+
+try:
+    from itertools import permutations
+except ImportError:
+    # Implementation of permutations from Python 2.6 documentation:
+    # http://docs.python.org/2.6/library/itertools.html#itertools.permutations
+    # Copyright (c) 2001-2010 Python Software Foundation; All Rights Reserved
+    # Modified syntax slightly to run under Python 2.4.
+    def permutations(iterable, r=None):
+        # permutations('ABCD', 2) --> AB AC AD BA BC BD CA CB CD DA DB DC
+        # permutations(range(3)) --> 012 021 102 120 201 210
+        pool = tuple(iterable)
+        n = len(pool)
+        if r is None:
+            r = n
+        if r > n:
+            return
+        indices = range(n)
+        cycles = range(n, n-r, -1)
+        yield tuple(pool[i] for i in indices[:r])
+        while n:
+            for i in reversed(range(r)):
+                cycles[i] -= 1
+                if cycles[i] == 0:
+                    indices[i:] = indices[i+1:] + indices[i:i+1]
+                    cycles[i] = n - i
+                else:
+                    j = cycles[i]
+                    indices[i], indices[-j] = indices[-j], indices[i]
+                    yield tuple(pool[i] for i in indices[:r])
+                    break
+            else:
+                return
+
+
+try:
+    all = all
+except NameError:
+    # Implementation of permutations from Python 2.6 documentation:
+    # http://docs.python.org/2.6/library/functions.html#all
+    # Copyright (c) 2001-2010 Python Software Foundation; All Rights Reserved
+    # Licensed under the Python Software Foundation License.
+    def all(iterable):
+        for element in iterable:
+            if not element:
+                return False
+        return True
+
+
+try:
+    from collections import namedtuple
+except ImportError:
+    # Recipe for namedtuple from http://code.activestate.com/recipes/500261/
+    # Copyright (c) 2007 Python Software Foundation; All Rights Reserved
+    # Licensed under the Python Software Foundation License.
+    from operator import itemgetter as _itemgetter
+    from keyword import iskeyword as _iskeyword
+    import sys as _sys
+
+    def namedtuple(typename, field_names, verbose=False, rename=False):
+        """Returns a new subclass of tuple with named fields.
+
+        >>> Point = namedtuple('Point', 'x y')
+        >>> Point.__doc__                   # docstring for the new class
+        'Point(x, y)'
+        >>> p = Point(11, y=22)             # instantiate with positional args or keywords
+        >>> p[0] + p[1]                     # indexable like a plain tuple
+        33
+        >>> x, y = p                        # unpack like a regular tuple
+        >>> x, y
+        (11, 22)
+        >>> p.x + p.y                       # fields also accessable by name
+        33
+        >>> d = p._asdict()                 # convert to a dictionary
+        >>> d['x']
+        11
+        >>> Point(**d)                      # convert from a dictionary
+        Point(x=11, y=22)
+        >>> p._replace(x=100)               # _replace() is like str.replace() but targets named fields
+        Point(x=100, y=22)
+
+        """
+
+        # Parse and validate the field names.  Validation serves two purposes,
+        # generating informative error messages and preventing template injection attacks.
+        if isinstance(field_names, basestring):
+            field_names = field_names.replace(',', ' ').split() # names separated by whitespace and/or commas
+        field_names = tuple(map(str, field_names))
+        if rename:
+            names = list(field_names)
+            seen = set()
+            for i, name in enumerate(names):
+                if (not min(c.isalnum() or c=='_' for c in name) or _iskeyword(name)
+                    or not name or name[0].isdigit() or name.startswith('_')
+                    or name in seen):
+                        names[i] = '_%d' % i
+                seen.add(name)
+            field_names = tuple(names)
+        for name in (typename,) + field_names:
+            if not min(c.isalnum() or c=='_' for c in name):
+                raise ValueError('Type names and field names can only contain alphanumeric characters and underscores: %r' % name)
+            if _iskeyword(name):
+                raise ValueError('Type names and field names cannot be a keyword: %r' % name)
+            if name[0].isdigit():
+                raise ValueError('Type names and field names cannot start with a number: %r' % name)
+        seen_names = set()
+        for name in field_names:
+            if name.startswith('_') and not rename:
+                raise ValueError('Field names cannot start with an underscore: %r' % name)
+            if name in seen_names:
+                raise ValueError('Encountered duplicate field name: %r' % name)
+            seen_names.add(name)
+
+        # Create and fill-in the class template
+        numfields = len(field_names)
+        argtxt = repr(field_names).replace("'", "")[1:-1]   # tuple repr without parens or quotes
+        reprtxt = ', '.join('%s=%%r' % name for name in field_names)
+        template = '''class %(typename)s(tuple):
+        '%(typename)s(%(argtxt)s)' \n
+        __slots__ = () \n
+        _fields = %(field_names)r \n
+        def __new__(_cls, %(argtxt)s):
+            return _tuple.__new__(_cls, (%(argtxt)s)) \n
+        @classmethod
+        def _make(cls, iterable, new=tuple.__new__, len=len):
+            'Make a new %(typename)s object from a sequence or iterable'
+            result = new(cls, iterable)
+            if len(result) != %(numfields)d:
+                raise TypeError('Expected %(numfields)d arguments, got %%d' %% len(result))
+            return result \n
+        def __repr__(self):
+            return '%(typename)s(%(reprtxt)s)' %% self \n
+        def _asdict(self):
+            'Return a new dict which maps field names to their values'
+            return dict(zip(self._fields, self)) \n
+        def _replace(_self, **kwds):
+            'Return a new %(typename)s object replacing specified fields with new values'
+            result = _self._make(map(kwds.pop, %(field_names)r, _self))
+            if kwds:
+                raise ValueError('Got unexpected field names: %%r' %% kwds.keys())
+            return result \n
+        def __getnewargs__(self):
+            return tuple(self) \n\n''' % locals()
+        for i, name in enumerate(field_names):
+            template += '        %s = _property(_itemgetter(%d))\n' % (name, i)
+        if verbose:
+            print template
+
+        # Execute the template string in a temporary namespace
+        namespace = dict(_itemgetter=_itemgetter, __name__='namedtuple_%s' % typename,
+                         _property=property, _tuple=tuple)
+        try:
+            exec template in namespace
+        except SyntaxError, e:
+            raise SyntaxError(e.message + ':\n' + template)
+        result = namespace[typename]
+
+        # For pickling to work, the __module__ variable needs to be set to the frame
+        # where the named tuple is created.  Bypass this step in enviroments where
+        # sys._getframe is not defined (Jython for example) or sys._getframe is not
+        # defined for arguments greater than 0 (IronPython).
+        try:
+            result.__module__ = _sys._getframe(1).f_globals.get('__name__', '__main__')
+        except (AttributeError, ValueError):
+            pass
+
+        return result
+
+
+# Backport of OrderedDict() class that runs on Python 2.4, 2.5, 2.6, 2.7 and pypy.
+# Passes Python2.7's test suite and incorporates all the latest updates.
 # Copyright (C) Raymond Hettinger, MIT license
 
 try:
@@ -41,14 +289,12 @@ class OrderedDict(dict):
     # An inherited dict maps keys to values.
     # The inherited dict provides __getitem__, __len__, __contains__, and get.
     # The remaining methods are order-aware.
-    # Big-O running times for all methods are the same as for regular
-    # dictionaries.
+    # Big-O running times for all methods are the same as for regular dictionaries.
 
-    # The internal self.__map dictionary maps keys to links in a doubly linked
-    # list. The circular doubly linked list starts and ends with a sentinel
-    # element. The sentinel element never gets deleted (this simplifies the
-    # algorithm). Each link is stored as a list of length three:  [PREV, NEXT,
-    # KEY].
+    # The internal self.__map dictionary maps keys to links in a doubly linked list.
+    # The circular doubly linked list starts and ends with a sentinel element.
+    # The sentinel element never gets deleted (this simplifies the algorithm).
+    # Each link is stored as a list of length three:  [PREV, NEXT, KEY].
 
     def __init__(self, *args, **kwds):
         '''Initialize an ordered dictionary.  Signature is the same as for
@@ -68,9 +314,8 @@ class OrderedDict(dict):
 
     def __setitem__(self, key, value, dict_setitem=dict.__setitem__):
         'od.__setitem__(i, y) <==> od[i]=y'
-        # Setting a new item creates a new link which goes at the end of the
-        # linked list, and the inherited dictionary is updated with the new
-        # key/value pair.
+        # Setting a new item creates a new link which goes at the end of the linked
+        # list, and the inherited dictionary is updated with the new key/value pair.
         if key not in self:
             root = self.__root
             last = root[0]
@@ -80,8 +325,7 @@ class OrderedDict(dict):
     def __delitem__(self, key, dict_delitem=dict.__delitem__):
         'od.__delitem__(y) <==> del od[y]'
         # Deleting an existing item uses self.__map to find the link which is
-        # then removed by updating the links in the predecessor and successor
-        # nodes.
+        # then removed by updating the links in the predecessor and successor nodes.
         dict_delitem(self, key)
         link_prev, link_next, key = self.__map.pop(key)
         link_prev[1] = link_next
@@ -167,12 +411,13 @@ class OrderedDict(dict):
             yield (k, self[k])
 
     def update(*args, **kwds):
-        """od.update(E, F) -> None.  Update od from dict/iterable E and F.
+        """od.update(E, **F) -> None.  Update od from dict/iterable E and F.
 
         If E is a dict instance, does:           for k in E: od[k] = E[k]
         If E has a .keys() method, does:         for k in E.keys(): od[k] = E[k]
         Or if E is an iterable of items, does:   for k, v in E: od[k] = v
         In either case, this is followed by:     for k, v in F.items(): od[k] = v
+
         """
         if len(args) > 2:
             raise TypeError('update() takes at most 2 positional '
@@ -196,8 +441,7 @@ class OrderedDict(dict):
         for key, value in kwds.items():
             self[key] = value
 
-    __update = update  # let subclasses override update without breaking
-                       # __init__
+    __update = update  # let subclasses override update without breaking __init__
 
     __marker = object()
 
@@ -284,680 +528,3 @@ class OrderedDict(dict):
     def viewitems(self):
         "od.viewitems() -> a set-like object providing a view on od's items"
         return ItemsView(self)
-
-
-# Copyright 2007 Google, Inc. All Rights Reserved.
-# Licensed to PSF under a Contributor Agreement.
-
-from abc import ABCMeta, abstractmethod
-import sys
-
-### ONE-TRICK PONIES ###
-
-def _hasattr(C, attr):
-    try:
-        return any(attr in B.__dict__ for B in C.__mro__)
-    except AttributeError:
-        # Old-style class
-        return hasattr(C, attr)
-
-
-class Hashable:
-    __metaclass__ = ABCMeta
-
-    @abstractmethod
-    def __hash__(self):
-        return 0
-
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Hashable:
-            try:
-                for B in C.__mro__:
-                    if "__hash__" in B.__dict__:
-                        if B.__dict__["__hash__"]:
-                            return True
-                        break
-            except AttributeError:
-                # Old-style class
-                if getattr(C, "__hash__", None):
-                    return True
-        return NotImplemented
-
-
-class Iterable:
-    __metaclass__ = ABCMeta
-
-    @abstractmethod
-    def __iter__(self):
-        while False:
-            yield None
-
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Iterable:
-            if _hasattr(C, "__iter__"):
-                return True
-        return NotImplemented
-
-Iterable.register(str)
-
-
-class Iterator(Iterable):
-
-    @abstractmethod
-    def next(self):
-        'Return the next item from the iterator. When exhausted, raise StopIteration'
-        raise StopIteration
-
-    def __iter__(self):
-        return self
-
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Iterator:
-            if _hasattr(C, "next") and _hasattr(C, "__iter__"):
-                return True
-        return NotImplemented
-
-
-class Sized:
-    __metaclass__ = ABCMeta
-
-    @abstractmethod
-    def __len__(self):
-        return 0
-
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Sized:
-            if _hasattr(C, "__len__"):
-                return True
-        return NotImplemented
-
-
-class Container:
-    __metaclass__ = ABCMeta
-
-    @abstractmethod
-    def __contains__(self, x):
-        return False
-
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Container:
-            if _hasattr(C, "__contains__"):
-                return True
-        return NotImplemented
-
-
-class Callable:
-    __metaclass__ = ABCMeta
-
-    @abstractmethod
-    def __call__(self, *args, **kwds):
-        return False
-
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Callable:
-            if _hasattr(C, "__call__"):
-                return True
-        return NotImplemented
-
-
-### SETS ###
-
-
-class Set(Sized, Iterable, Container):
-    """A set is a finite, iterable container.
-
-    This class provides concrete generic implementations of all
-    methods except for __contains__, __iter__ and __len__.
-
-    To override the comparisons (presumably for speed, as the
-    semantics are fixed), all you have to do is redefine __le__ and
-    then the other operations will automatically follow suit.
-    """
-
-    def __le__(self, other):
-        if not isinstance(other, Set):
-            return NotImplemented
-        if len(self) > len(other):
-            return False
-        for elem in self:
-            if elem not in other:
-                return False
-        return True
-
-    def __lt__(self, other):
-        if not isinstance(other, Set):
-            return NotImplemented
-        return len(self) < len(other) and self.__le__(other)
-
-    def __gt__(self, other):
-        if not isinstance(other, Set):
-            return NotImplemented
-        return len(self) > len(other) and self.__ge__(other)
-
-    def __ge__(self, other):
-        if not isinstance(other, Set):
-            return NotImplemented
-        if len(self) < len(other):
-            return False
-        for elem in other:
-            if elem not in self:
-                return False
-        return True
-
-    def __eq__(self, other):
-        if not isinstance(other, Set):
-            return NotImplemented
-        return len(self) == len(other) and self.__le__(other)
-
-    def __ne__(self, other):
-        return not (self == other)
-
-    @classmethod
-    def _from_iterable(cls, it):
-        '''Construct an instance of the class from any iterable input.
-
-        Must override this method if the class constructor signature
-        does not accept an iterable for an input.
-        '''
-        return cls(it)
-
-    def __and__(self, other):
-        if not isinstance(other, Iterable):
-            return NotImplemented
-        return self._from_iterable(value for value in other if value in self)
-
-    __rand__ = __and__
-
-    def isdisjoint(self, other):
-        'Return True if two sets have a null intersection.'
-        for value in other:
-            if value in self:
-                return False
-        return True
-
-    def __or__(self, other):
-        if not isinstance(other, Iterable):
-            return NotImplemented
-        chain = (e for s in (self, other) for e in s)
-        return self._from_iterable(chain)
-
-    __ror__ = __or__
-
-    def __sub__(self, other):
-        if not isinstance(other, Set):
-            if not isinstance(other, Iterable):
-                return NotImplemented
-            other = self._from_iterable(other)
-        return self._from_iterable(value for value in self
-                                   if value not in other)
-
-    def __rsub__(self, other):
-        if not isinstance(other, Set):
-            if not isinstance(other, Iterable):
-                return NotImplemented
-            other = self._from_iterable(other)
-        return self._from_iterable(value for value in other
-                                   if value not in self)
-
-    def __xor__(self, other):
-        if not isinstance(other, Set):
-            if not isinstance(other, Iterable):
-                return NotImplemented
-            other = self._from_iterable(other)
-        return (self - other) | (other - self)
-
-    __rxor__ = __xor__
-
-    # Sets are not hashable by default, but subclasses can change this
-    __hash__ = None
-
-    def _hash(self):
-        """Compute the hash value of a set.
-
-        Note that we don't define __hash__: not all sets are hashable.
-        But if you define a hashable set type, its __hash__ should
-        call this function.
-
-        This must be compatible __eq__.
-
-        All sets ought to compare equal if they contain the same
-        elements, regardless of how they are implemented, and
-        regardless of the order of the elements; so there's not much
-        freedom for __eq__ or __hash__.  We match the algorithm used
-        by the built-in frozenset type.
-        """
-        MAX = sys.maxint
-        MASK = 2 * MAX + 1
-        n = len(self)
-        h = 1927868237 * (n + 1)
-        h &= MASK
-        for x in self:
-            hx = hash(x)
-            h ^= (hx ^ (hx << 16) ^ 89869747)  * 3644798167
-            h &= MASK
-        h = h * 69069 + 907133923
-        h &= MASK
-        if h > MAX:
-            h -= MASK + 1
-        if h == -1:
-            h = 590923713
-        return h
-
-Set.register(frozenset)
-
-
-class MutableSet(Set):
-    """A mutable set is a finite, iterable container.
-
-    This class provides concrete generic implementations of all
-    methods except for __contains__, __iter__, __len__,
-    add(), and discard().
-
-    To override the comparisons (presumably for speed, as the
-    semantics are fixed), all you have to do is redefine __le__ and
-    then the other operations will automatically follow suit.
-    """
-
-    @abstractmethod
-    def add(self, value):
-        """Add an element."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def discard(self, value):
-        """Remove an element.  Do not raise an exception if absent."""
-        raise NotImplementedError
-
-    def remove(self, value):
-        """Remove an element. If not a member, raise a KeyError."""
-        if value not in self:
-            raise KeyError(value)
-        self.discard(value)
-
-    def pop(self):
-        """Return the popped value.  Raise KeyError if empty."""
-        it = iter(self)
-        try:
-            value = next(it)
-        except StopIteration:
-            raise KeyError
-        self.discard(value)
-        return value
-
-    def clear(self):
-        """This is slow (creates N new iterators!) but effective."""
-        try:
-            while True:
-                self.pop()
-        except KeyError:
-            pass
-
-    def __ior__(self, it):
-        for value in it:
-            self.add(value)
-        return self
-
-    def __iand__(self, it):
-        for value in (self - it):
-            self.discard(value)
-        return self
-
-    def __ixor__(self, it):
-        if it is self:
-            self.clear()
-        else:
-            if not isinstance(it, Set):
-                it = self._from_iterable(it)
-            for value in it:
-                if value in self:
-                    self.discard(value)
-                else:
-                    self.add(value)
-        return self
-
-    def __isub__(self, it):
-        if it is self:
-            self.clear()
-        else:
-            for value in it:
-                self.discard(value)
-        return self
-
-MutableSet.register(set)
-
-
-### MAPPINGS ###
-
-
-class Mapping(Sized, Iterable, Container):
-
-    """A Mapping is a generic container for associating key/value
-    pairs.
-
-    This class provides concrete generic implementations of all
-    methods except for __getitem__, __iter__, and __len__.
-
-    """
-
-    @abstractmethod
-    def __getitem__(self, key):
-        raise KeyError
-
-    def get(self, key, default=None):
-        'D.get(k[,d]) -> D[k] if k in D, else d.  d defaults to None.'
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def __contains__(self, key):
-        try:
-            self[key]
-        except KeyError:
-            return False
-        else:
-            return True
-
-    def iterkeys(self):
-        'D.iterkeys() -> an iterator over the keys of D'
-        return iter(self)
-
-    def itervalues(self):
-        'D.itervalues() -> an iterator over the values of D'
-        for key in self:
-            yield self[key]
-
-    def iteritems(self):
-        'D.iteritems() -> an iterator over the (key, value) items of D'
-        for key in self:
-            yield (key, self[key])
-
-    def keys(self):
-        "D.keys() -> list of D's keys"
-        return list(self)
-
-    def items(self):
-        "D.items() -> list of D's (key, value) pairs, as 2-tuples"
-        return [(key, self[key]) for key in self]
-
-    def values(self):
-        "D.values() -> list of D's values"
-        return [self[key] for key in self]
-
-    # Mappings are not hashable by default, but subclasses can change this
-    __hash__ = None
-
-    def __eq__(self, other):
-        if not isinstance(other, Mapping):
-            return NotImplemented
-        return dict(self.items()) == dict(other.items())
-
-    def __ne__(self, other):
-        return not (self == other)
-
-class MappingView(Sized):
-
-    def __init__(self, mapping):
-        self._mapping = mapping
-
-    def __len__(self):
-        return len(self._mapping)
-
-    def __repr__(self):
-        return '{0.__class__.__name__}({0._mapping!r})'.format(self)
-
-
-class KeysView(MappingView, Set):
-
-    @classmethod
-    def _from_iterable(self, it):
-        return set(it)
-
-    def __contains__(self, key):
-        return key in self._mapping
-
-    def __iter__(self):
-        for key in self._mapping:
-            yield key
-
-
-class ItemsView(MappingView, Set):
-
-    @classmethod
-    def _from_iterable(self, it):
-        return set(it)
-
-    def __contains__(self, item):
-        key, value = item
-        try:
-            v = self._mapping[key]
-        except KeyError:
-            return False
-        else:
-            return v == value
-
-    def __iter__(self):
-        for key in self._mapping:
-            yield (key, self._mapping[key])
-
-
-class ValuesView(MappingView):
-
-    def __contains__(self, value):
-        for key in self._mapping:
-            if value == self._mapping[key]:
-                return True
-        return False
-
-    def __iter__(self):
-        for key in self._mapping:
-            yield self._mapping[key]
-
-
-class MutableMapping(Mapping):
-
-    """A MutableMapping is a generic container for associating
-    key/value pairs.
-
-    This class provides concrete generic implementations of all
-    methods except for __getitem__, __setitem__, __delitem__,
-    __iter__, and __len__.
-
-    """
-
-    @abstractmethod
-    def __setitem__(self, key, value):
-        raise KeyError
-
-    @abstractmethod
-    def __delitem__(self, key):
-        raise KeyError
-
-    __marker = object()
-
-    def pop(self, key, default=__marker):
-        '''D.pop(k[,d]) -> v, remove specified key and return the corresponding value.
-          If key is not found, d is returned if given, otherwise KeyError is raised.
-        '''
-        try:
-            value = self[key]
-        except KeyError:
-            if default is self.__marker:
-                raise
-            return default
-        else:
-            del self[key]
-            return value
-
-    def popitem(self):
-        '''D.popitem() -> (k, v), remove and return some (key, value) pair
-           as a 2-tuple; but raise KeyError if D is empty.
-        '''
-        try:
-            key = next(iter(self))
-        except StopIteration:
-            raise KeyError
-        value = self[key]
-        del self[key]
-        return key, value
-
-    def clear(self):
-        'D.clear() -> None.  Remove all items from D.'
-        try:
-            while True:
-                self.popitem()
-        except KeyError:
-            pass
-
-    def update(*args, **kwds):
-        ''' D.update([E, ]**F) -> None.  Update D from mapping/iterable E and F.
-            If E present and has a .keys() method, does:     for k in E: D[k] = E[k]
-            If E present and lacks .keys() method, does:     for (k, v) in E: D[k] = v
-            In either case, this is followed by: for k, v in F.items(): D[k] = v
-        '''
-        if len(args) > 2:
-            raise TypeError("update() takes at most 2 positional "
-                            "arguments ({} given)".format(len(args)))
-        elif not args:
-            raise TypeError("update() takes at least 1 argument (0 given)")
-        self = args[0]
-        other = args[1] if len(args) >= 2 else ()
-
-        if isinstance(other, Mapping):
-            for key in other:
-                self[key] = other[key]
-        elif hasattr(other, "keys"):
-            for key in other.keys():
-                self[key] = other[key]
-        else:
-            for key, value in other:
-                self[key] = value
-        for key, value in kwds.items():
-            self[key] = value
-
-    def setdefault(self, key, default=None):
-        'D.setdefault(k[,d]) -> D.get(k,d), also set D[k]=d if k not in D'
-        try:
-            return self[key]
-        except KeyError:
-            self[key] = default
-        return default
-
-MutableMapping.register(dict)
-
-
-### SEQUENCES ###
-
-
-class Sequence(Sized, Iterable, Container):
-    """All the operations on a read-only sequence.
-
-    Concrete subclasses must override __new__ or __init__,
-    __getitem__, and __len__.
-    """
-
-    @abstractmethod
-    def __getitem__(self, index):
-        raise IndexError
-
-    def __iter__(self):
-        i = 0
-        try:
-            while True:
-                v = self[i]
-                yield v
-                i += 1
-        except IndexError:
-            return
-
-    def __contains__(self, value):
-        for v in self:
-            if v == value:
-                return True
-        return False
-
-    def __reversed__(self):
-        for i in reversed(range(len(self))):
-            yield self[i]
-
-    def index(self, value):
-        '''S.index(value) -> integer -- return first index of value.
-           Raises ValueError if the value is not present.
-        '''
-        for i, v in enumerate(self):
-            if v == value:
-                return i
-        raise ValueError
-
-    def count(self, value):
-        'S.count(value) -> integer -- return number of occurrences of value'
-        return sum(1 for v in self if v == value)
-
-Sequence.register(tuple)
-Sequence.register(basestring)
-Sequence.register(buffer)
-Sequence.register(xrange)
-
-
-class MutableSequence(Sequence):
-
-    """All the operations on a read-only sequence.
-
-    Concrete subclasses must provide __new__ or __init__,
-    __getitem__, __setitem__, __delitem__, __len__, and insert().
-
-    """
-
-    @abstractmethod
-    def __setitem__(self, index, value):
-        raise IndexError
-
-    @abstractmethod
-    def __delitem__(self, index):
-        raise IndexError
-
-    @abstractmethod
-    def insert(self, index, value):
-        'S.insert(index, object) -- insert object before index'
-        raise IndexError
-
-    def append(self, value):
-        'S.append(object) -- append object to the end of the sequence'
-        self.insert(len(self), value)
-
-    def reverse(self):
-        'S.reverse() -- reverse *IN PLACE*'
-        n = len(self)
-        for i in range(n//2):
-            self[i], self[n-i-1] = self[n-i-1], self[i]
-
-    def extend(self, values):
-        'S.extend(iterable) -- extend sequence by appending elements from the iterable'
-        for v in values:
-            self.append(v)
-
-    def pop(self, index=-1):
-        '''S.pop([index]) -> item -- remove and return item at index (default last).
-           Raise IndexError if list is empty or index is out of range.
-        '''
-        v = self[index]
-        del self[index]
-        return v
-
-    def remove(self, value):
-        '''S.remove(value) -- remove first occurrence of value.
-           Raise ValueError if the value is not present.
-        '''
-        del self[self.index(value)]
-
-    def __iadd__(self, values):
-        self.extend(values)
-        return self
-
-MutableSequence.register(list)

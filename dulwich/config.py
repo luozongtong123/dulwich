@@ -1,5 +1,5 @@
 # config.py - Reading and writing Git config files
-# Copyright (C) 2011-2013 Jelmer Vernooij <jelmer@samba.org>
+# Copyright (C) 2011 Jelmer Vernooij <jelmer@samba.org>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -26,18 +26,14 @@ TODO:
 
 import errno
 import os
+import re
 
 try:
-    from collections import (
-        OrderedDict,
-        MutableMapping,
-        )
+    from collections import OrderedDict
 except ImportError:
-    from dulwich._compat import (
-        OrderedDict,
-        MutableMapping
-        )
+    from dulwich._compat import OrderedDict
 
+from UserDict import DictMixin
 
 from dulwich.file import GitFile
 
@@ -68,39 +64,23 @@ class Config(object):
             value = self.get(section, name)
         except KeyError:
             return default
-        if value.lower() == b"true":
+        if value.lower() == "true":
             return True
-        elif value.lower() == b"false":
+        elif value.lower() == "false":
             return False
         raise ValueError("not a valid boolean string: %r" % value)
 
     def set(self, section, name, value):
         """Set a configuration value.
 
-        :param section: Tuple with section name and optional subsection namee
         :param name: Name of the configuration value, including section
             and optional subsection
         :param: Value of the setting
         """
         raise NotImplementedError(self.set)
 
-    def iteritems(self, section):
-        """Iterate over the configuration pairs for a specific section.
 
-        :param section: Tuple with section name and optional subsection namee
-        :return: Iterator over (name, value) pairs
-        """
-        raise NotImplementedError(self.iteritems)
-
-    def itersections(self):
-        """Iterate over the sections.
-
-        :return: Iterator over section tuples
-        """
-        raise NotImplementedError(self.itersections)
-
-
-class ConfigDict(Config, MutableMapping):
+class ConfigDict(Config, DictMixin):
     """Git configuration stored in a dictionary."""
 
     def __init__(self, values=None):
@@ -118,19 +98,13 @@ class ConfigDict(Config, MutableMapping):
             other._values == self._values)
 
     def __getitem__(self, key):
-        return self._values.__getitem__(key)
+        return self._values[key]
 
     def __setitem__(self, key, value):
-        return self._values.__setitem__(key, value)
+        self._values[key] = value
 
-    def __delitem__(self, key):
-        return self._values.__delitem__(key)
-
-    def __iter__(self):
-        return self._values.__iter__()
-
-    def __len__(self):
-        return self._values.__len__()
+    def keys(self):
+        return self._values.keys()
 
     @classmethod
     def _parse_setting(cls, name):
@@ -141,7 +115,7 @@ class ConfigDict(Config, MutableMapping):
             return (parts[0], None, parts[1])
 
     def get(self, section, name):
-        if not isinstance(section, tuple):
+        if isinstance(section, basestring):
             section = (section, )
         if len(section) > 1:
             try:
@@ -151,112 +125,79 @@ class ConfigDict(Config, MutableMapping):
         return self._values[(section[0],)][name]
 
     def set(self, section, name, value):
-        if not isinstance(section, tuple):
+        if isinstance(section, basestring):
             section = (section, )
         self._values.setdefault(section, OrderedDict())[name] = value
 
-    def iteritems(self, section):
-        return self._values.get(section, OrderedDict()).items()
-
-    def itersections(self):
-        return self._values.keys()
-
 
 def _format_string(value):
-    if (value.startswith(b" ") or
-        value.startswith(b"\t") or
-        value.endswith(b" ") or
-        value.endswith(b"\t")):
-        return b'"' + _escape_value(value) + b'"'
+    if (value.startswith(" ") or
+        value.startswith("\t") or
+        value.endswith(" ") or
+        value.endswith("\t")):
+        return '"%s"' % _escape_value(value)
     return _escape_value(value)
 
 
-_ESCAPE_TABLE = {
-    ord(b"\\"): ord(b"\\"),
-    ord(b"\""): ord(b"\""),
-    ord(b"n"): ord(b"\n"),
-    ord(b"t"): ord(b"\t"),
-    ord(b"b"): ord(b"\b"),
-    }
-_COMMENT_CHARS = [ord(b"#"), ord(b";")]
-_WHITESPACE_CHARS = [ord(b"\t"), ord(b" ")]
-
 def _parse_string(value):
-    value = bytearray(value.strip())
-    ret = bytearray()
-    whitespace = bytearray()
-    in_quotes = False
-    i = 0
-    while i < len(value):
-        c = value[i]
-        if c == ord(b"\\"):
-            i += 1
-            try:
-                v = _ESCAPE_TABLE[value[i]]
-            except IndexError:
-                raise ValueError(
-                    "escape character in %r at %d before end of string" %
-                    (value, i))
-            except KeyError:
-                raise ValueError(
-                    "escape character followed by unknown character %s at %d in %r" %
-                    (value[i], i, value))
-            if whitespace:
-                ret.extend(whitespace)
-                whitespace = bytearray()
-            ret.append(v)
-        elif c == ord(b"\""):
+    value = value.strip()
+    ret = []
+    block = []
+    in_quotes  = False
+    for c in value:
+        if c == "\"":
             in_quotes = (not in_quotes)
-        elif c in _COMMENT_CHARS and not in_quotes:
+            ret.append(_unescape_value("".join(block)))
+            block = []
+        elif c in ("#", ";") and not in_quotes:
             # the rest of the line is a comment
             break
-        elif c in _WHITESPACE_CHARS:
-            whitespace.append(c)
         else:
-            if whitespace:
-                ret.extend(whitespace)
-                whitespace = bytearray()
-            ret.append(c)
-        i += 1
+            block.append(c)
 
     if in_quotes:
-        raise ValueError("missing end quote")
+        raise ValueError("value starts with quote but lacks end quote")
 
-    return bytes(ret)
+    ret.append(_unescape_value("".join(block)).rstrip())
+
+    return "".join(ret)
 
 
 def _unescape_value(value):
     """Unescape a value."""
-    ret = bytearray()
-    i = 0
-
-    return ret
+    def unescape(c):
+        return {
+            "\\\\": "\\",
+            "\\\"": "\"",
+            "\\n": "\n",
+            "\\t": "\t",
+            "\\b": "\b",
+            }[c.group(0)]
+    return re.sub(r"(\\.)", unescape, value)
 
 
 def _escape_value(value):
     """Escape a value."""
-    return value.replace(b"\\", b"\\\\").replace(b"\n", b"\\n").replace(b"\t", b"\\t").replace(b"\"", b"\\\"")
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\"", "\\\"")
 
 
 def _check_variable_name(name):
-    for i in range(len(name)):
-        c = name[i:i+1]
-        if not c.isalnum() and c != b'-':
+    for c in name:
+        if not c.isalnum() and c != '-':
             return False
     return True
 
 
 def _check_section_name(name):
-    for i in range(len(name)):
-        c = name[i:i+1]
-        if not c.isalnum() and c not in (b'-', b'.'):
+    for c in name:
+        if not c.isalnum() and c not in ('-', '.'):
             return False
     return True
 
 
 def _strip_comments(line):
-    line = line.split(b"#")[0]
-    line = line.split(b";")[0]
+    line = line.split("#")[0]
+    line = line.split(";")[0]
     return line
 
 
@@ -273,48 +214,47 @@ class ConfigFile(ConfigDict):
         for lineno, line in enumerate(f.readlines()):
             line = line.lstrip()
             if setting is None:
-                # Parse section header ("[bla]")
-                if len(line) > 0 and line[:1] == b"[":
+                if len(line) > 0 and line[0] == "[":
                     line = _strip_comments(line).rstrip()
-                    last = line.index(b"]")
+                    last = line.index("]")
                     if last == -1:
                         raise ValueError("expected trailing ]")
-                    pts = line[1:last].split(b" ", 1)
+                    pts = line[1:last].split(" ", 1)
                     line = line[last+1:]
                     pts[0] = pts[0].lower()
                     if len(pts) == 2:
-                        if pts[1][:1] != b"\"" or pts[1][-1:] != b"\"":
+                        if pts[1][0] != "\"" or pts[1][-1] != "\"":
                             raise ValueError(
-                                "Invalid subsection %r" % pts[1])
+                                "Invalid subsection " + pts[1])
                         else:
                             pts[1] = pts[1][1:-1]
                         if not _check_section_name(pts[0]):
-                            raise ValueError("invalid section name %r" %
+                            raise ValueError("invalid section name %s" %
                                              pts[0])
                         section = (pts[0], pts[1])
                     else:
                         if not _check_section_name(pts[0]):
-                            raise ValueError("invalid section name %r" %
+                            raise ValueError("invalid section name %s" %
                                     pts[0])
-                        pts = pts[0].split(b".", 1)
+                        pts = pts[0].split(".", 1)
                         if len(pts) == 2:
                             section = (pts[0], pts[1])
                         else:
                             section = (pts[0], )
                     ret._values[section] = OrderedDict()
-                if _strip_comments(line).strip() == b"":
+                if _strip_comments(line).strip() == "":
                     continue
                 if section is None:
                     raise ValueError("setting %r without section" % line)
                 try:
-                    setting, value = line.split(b"=", 1)
+                    setting, value = line.split("=", 1)
                 except ValueError:
                     setting = line
-                    value = b"true"
+                    value = "true"
                 setting = setting.strip().lower()
                 if not _check_variable_name(setting):
                     raise ValueError("invalid variable name %s" % setting)
-                if value.endswith(b"\\\n"):
+                if value.endswith("\\\n"):
                     value = value[:-2]
                     continuation = True
                 else:
@@ -323,8 +263,8 @@ class ConfigFile(ConfigDict):
                 ret._values[section][setting] = value
                 if not continuation:
                     setting = None
-            else:  # continuation line
-                if line.endswith(b"\\\n"):
+            else: # continuation line
+                if line.endswith("\\\n"):
                     line = line[:-2]
                     continuation = True
                 else:
@@ -338,38 +278,38 @@ class ConfigFile(ConfigDict):
     @classmethod
     def from_path(cls, path):
         """Read configuration from a file on disk."""
-        with GitFile(path, 'rb') as f:
+        f = GitFile(path, 'rb')
+        try:
             ret = cls.from_file(f)
             ret.path = path
             return ret
+        finally:
+            f.close()
 
     def write_to_path(self, path=None):
         """Write configuration to a file on disk."""
         if path is None:
             path = self.path
-        with GitFile(path, 'wb') as f:
+        f = GitFile(path, 'wb')
+        try:
             self.write_to_file(f)
+        finally:
+            f.close()
 
     def write_to_file(self, f):
         """Write configuration to a file-like object."""
-        for section, values in self._values.items():
+        for section, values in self._values.iteritems():
             try:
                 section_name, subsection_name = section
             except ValueError:
                 (section_name, ) = section
                 subsection_name = None
             if subsection_name is None:
-                f.write(b"[" + section_name + b"]\n")
+                f.write("[%s]\n" % section_name)
             else:
-                f.write(b"[" + section_name + b" \"" + subsection_name + b"\"]\n")
-            for key, value in values.items():
-                if value is True:
-                    value = b"true"
-                elif value is False:
-                    value = b"false"
-                else:
-                    value = _escape_value(value)
-                f.write(b"\t" + key + b" = " + value + b"\n")
+                f.write("[%s \"%s\"]\n" % (section_name, subsection_name))
+            for key, value in values.iteritems():
+                f.write("\t%s = %s\n" % (key, _escape_value(value)))
 
 
 class StackedConfig(Config):
@@ -386,7 +326,8 @@ class StackedConfig(Config):
     def default_backends(cls):
         """Retrieve the default configuration.
 
-        This will look in the users' home directory and the system
+        This will look in the repository configuration (if for_path is
+        specified), the users' home directory and the system
         configuration.
         """
         paths = []
@@ -396,7 +337,7 @@ class StackedConfig(Config):
         for path in paths:
             try:
                 cf = ConfigFile.from_path(path)
-            except (IOError, OSError) as e:
+            except (IOError, OSError), e:
                 if e.errno != errno.ENOENT:
                     raise
                 else:

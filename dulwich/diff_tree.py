@@ -17,21 +17,23 @@
 # MA  02110-1301, USA.
 
 """Utilities for diffing files and trees."""
-import sys
-from collections import (
-    defaultdict,
-    namedtuple,
-    )
 
-from io import BytesIO
-from itertools import chain
+try:
+    from collections import defaultdict
+except ImportError:
+    from dulwich._compat import defaultdict
+
+from cStringIO import StringIO
+import itertools
 import stat
 
+from dulwich._compat import (
+    namedtuple,
+    )
 from dulwich.objects import (
     S_ISGITLINK,
     TreeEntry,
     )
-
 
 # TreeChange type constants.
 CHANGE_ADD = 'add'
@@ -103,9 +105,9 @@ def _merge_entries(path, tree1, tree2):
             result.append((entry1, entry2))
             i1 += 1
             i2 += 1
-    for i in range(i1, len1):
+    for i in xrange(i1, len1):
         result.append((entries1[i], _NULL_ENTRY))
-    for i in range(i2, len2):
+    for i in xrange(i2, len2):
         result.append((_NULL_ENTRY, entries2[i]))
     return result
 
@@ -132,11 +134,10 @@ def walk_trees(store, tree1_id, tree2_id, prune_identical=False):
         to None. If neither entry's path is None, they are guaranteed to
         match.
     """
-    # This could be fairly easily generalized to >2 trees if we find a use
-    # case.
+    # This could be fairly easily generalized to >2 trees if we find a use case.
     mode1 = tree1_id and stat.S_IFDIR or None
     mode2 = tree2_id and stat.S_IFDIR or None
-    todo = [(TreeEntry(b'', mode1, tree1_id), TreeEntry(b'', mode2, tree2_id))]
+    todo = [(TreeEntry('', mode1, tree1_id), TreeEntry('', mode2, tree2_id))]
     while todo:
         entry1, entry2 = todo.pop()
         is_tree1 = _is_tree(entry1)
@@ -173,8 +174,8 @@ def tree_changes(store, tree1_id, tree2_id, want_unchanged=False,
     if (rename_detector is not None and tree1_id is not None and
         tree2_id is not None):
         for change in rename_detector.changes_with_renames(
-            tree1_id, tree2_id, want_unchanged=want_unchanged):
-                yield change
+          tree1_id, tree2_id, want_unchanged=want_unchanged):
+            yield change
         return
 
     entries = walk_trees(store, tree1_id, tree2_id,
@@ -231,8 +232,8 @@ def tree_changes_for_merge(store, parent_tree_ids, tree_id,
         in the merge.
 
         Each list contains one element per parent, with the TreeChange for that
-        path relative to that parent. An element may be None if it never
-        existed in one parent and was deleted in two others.
+        path relative to that parent. An element may be None if it never existed
+        in one parent and was deleted in two others.
 
         A path is only included in the output if it is a conflict, i.e. its SHA
         in the merge tree is not found in any of the parents, or in the case of
@@ -257,7 +258,7 @@ def tree_changes_for_merge(store, parent_tree_ids, tree_id,
     change_type = lambda c: c.type
 
     # Yield only conflicting changes.
-    for _, changes in sorted(changes_by_path.items()):
+    for _, changes in sorted(changes_by_path.iteritems()):
         assert len(changes) == num_parents
         have = [c for c in changes if c is not None]
         if _all_eq(have, change_type, CHANGE_DELETE):
@@ -267,8 +268,7 @@ def tree_changes_for_merge(store, parent_tree_ids, tree_id,
             yield changes
         elif None not in changes:
             # If no change was found relative to one parent, that means the SHA
-            # must have matched the SHA in that parent, so it is not a
-            # conflict.
+            # must have matched the SHA in that parent, so it is not a conflict.
             yield changes
 
 
@@ -284,7 +284,7 @@ def _count_blocks(obj):
     :return: A dict of block hashcode -> total bytes occurring.
     """
     block_counts = defaultdict(int)
-    block = BytesIO()
+    block = StringIO()
     n = 0
 
     # Cache attrs as locals to avoid expensive lookups in the inner loop.
@@ -293,12 +293,10 @@ def _count_blocks(obj):
     block_truncate = block.truncate
     block_getvalue = block.getvalue
 
-    for c in chain(*obj.as_raw_chunks()):
-        if sys.version_info[0] == 3:
-            c = c.to_bytes(1, 'big')
+    for c in itertools.chain(*obj.as_raw_chunks()):
         block_write(c)
         n += 1
-        if c == b'\n' or n == _BLOCK_SIZE:
+        if c == '\n' or n == _BLOCK_SIZE:
             value = block_getvalue()
             block_counts[hash(value)] += len(value)
             block_seek(0)
@@ -322,7 +320,7 @@ def _common_bytes(blocks1, blocks2):
     if len(blocks1) > len(blocks2):
         blocks1, blocks2 = blocks2, blocks1
     score = 0
-    for block, count1 in blocks1.items():
+    for block, count1 in blocks1.iteritems():
         count2 = blocks2.get(block)
         if count2:
             score += min(count1, count2)
@@ -334,11 +332,11 @@ def _similarity_score(obj1, obj2, block_cache=None):
 
     :param obj1: The first object to score.
     :param obj2: The second object to score.
-    :param block_cache: An optional dict of SHA to block counts to cache
-        results between calls.
-    :return: The similarity score between the two objects, defined as the
-        number of bytes in common between the two objects divided by the
-        maximum size, scaled to the range 0-100.
+    :param block_cache: An optional dict of SHA to block counts to cache results
+        between calls.
+    :return: The similarity score between the two objects, defined as the number
+        of bytes in common between the two objects divided by the maximum size,
+        scaled to the range 0-100.
     """
     if block_cache is None:
         block_cache = {}
@@ -377,8 +375,8 @@ class RenameDetector(object):
         :param store: An ObjectStore for looking up objects.
         :param rename_threshold: The threshold similarity score for considering
             an add/delete pair to be a rename/copy; see _similarity_score.
-        :param max_files: The maximum number of adds and deletes to consider,
-            or None for no limit. The detector is guaranteed to compare no more
+        :param max_files: The maximum number of adds and deletes to consider, or
+            None for no limit. The detector is guaranteed to compare no more
             than max_files ** 2 add/delete pairs. This limit is provided because
             rename detection can be quadratic in the project size. If the limit
             is exceeded, no content rename detection is attempted.
@@ -450,9 +448,9 @@ class RenameDetector(object):
 
         add_paths = set()
         delete_paths = set()
-        for sha, sha_deletes in delete_map.items():
+        for sha, sha_deletes in delete_map.iteritems():
             sha_adds = add_map[sha]
-            for (old, is_delete), new in zip(sha_deletes, sha_adds):
+            for (old, is_delete), new in itertools.izip(sha_deletes, sha_adds):
                 if stat.S_IFMT(old.mode) != stat.S_IFMT(new.mode):
                     continue
                 if is_delete:
@@ -464,7 +462,7 @@ class RenameDetector(object):
             num_extra_adds = len(sha_adds) - len(sha_deletes)
             # TODO(dborowitz): Less arbitrary way of dealing with extra copies.
             old = sha_deletes[0][0]
-            if num_extra_adds > 0:
+            if num_extra_adds:
                 for new in sha_adds[-num_extra_adds:]:
                     add_paths.add(new.path)
                     self._changes.append(TreeChange(CHANGE_COPY, old, new))
@@ -480,8 +478,7 @@ class RenameDetector(object):
             return CHANGE_MODIFY
         elif delete.type != CHANGE_DELETE:
             # If it's in deletes but not marked as a delete, it must have been
-            # added due to find_copies_harder, and needs to be marked as a
-            # copy.
+            # added due to find_copies_harder, and needs to be marked as a copy.
             return CHANGE_COPY
         return CHANGE_RENAME
 
@@ -496,28 +493,26 @@ class RenameDetector(object):
         if not self._should_find_content_renames():
             return
 
-        block_cache = {}
         check_paths = self._rename_threshold is not None
         for delete in self._deletes:
             if S_ISGITLINK(delete.old.mode):
                 continue  # Git links don't exist in this repo.
             old_sha = delete.old.sha
             old_obj = self._store[old_sha]
-            block_cache[old_sha] = _count_blocks(old_obj)
+            old_blocks = _count_blocks(old_obj)
             for add in self._adds:
                 if stat.S_IFMT(delete.old.mode) != stat.S_IFMT(add.new.mode):
                     continue
                 new_obj = self._store[add.new.sha]
                 score = _similarity_score(old_obj, new_obj,
-                                          block_cache=block_cache)
+                                          block_cache={old_sha: old_blocks})
                 if score > self._rename_threshold:
                     new_type = self._rename_type(check_paths, delete, add)
                     rename = TreeChange(new_type, delete.old, add.new)
                     candidates.append((-score, rename))
 
     def _choose_content_renames(self):
-        # Sort scores from highest to lowest, but keep names in ascending
-        # order.
+        # Sort scores from highest to lowest, but keep names in ascending order.
         self._candidates.sort()
 
         delete_paths = set()
@@ -549,12 +544,11 @@ class RenameDetector(object):
             path = add.new.path
             delete = delete_map.get(path)
             if (delete is not None and
-                stat.S_IFMT(delete.old.mode) == stat.S_IFMT(add.new.mode)):
+              stat.S_IFMT(delete.old.mode) == stat.S_IFMT(add.new.mode)):
                 modifies[path] = TreeChange(CHANGE_MODIFY, delete.old, add.new)
 
         self._adds = [a for a in self._adds if a.new.path not in modifies]
-        self._deletes = [a for a in self._deletes if a.new.path not in
-                         modifies]
+        self._deletes = [a for a in self._deletes if a.new.path not in modifies]
         self._changes += modifies.values()
 
     def _sorted_changes(self):

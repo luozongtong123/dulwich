@@ -23,15 +23,13 @@
 """
 import errno
 import os
-import sys
 
 from dulwich.errors import (
     PackedRefsException,
     RefFormatError,
     )
 from dulwich.objects import (
-    git_line,
-    valid_hexsha,
+    hex_to_sha,
     )
 from dulwich.file import (
     GitFile,
@@ -39,9 +37,7 @@ from dulwich.file import (
     )
 
 
-SYMREF = b'ref: '
-LOCAL_BRANCH_PREFIX = b'refs/heads/'
-BAD_REF_CHARS = set(b'\177 ~^:?*[')
+SYMREF = 'ref: '
 
 
 def check_ref_format(refname):
@@ -56,22 +52,22 @@ def check_ref_format(refname):
     """
     # These could be combined into one big expression, but are listed separately
     # to parallel [1].
-    if b'/.' in refname or refname.startswith(b'.'):
+    if '/.' in refname or refname.startswith('.'):
         return False
-    if b'/' not in refname:
+    if '/' not in refname:
         return False
-    if b'..' in refname:
+    if '..' in refname:
         return False
-    for i, c in enumerate(refname):
-        if ord(refname[i:i+1]) < 0o40 or c in BAD_REF_CHARS:
+    for c in refname:
+        if ord(c) < 0o40 or c in '\177 ~^:?*[':
             return False
-    if refname[-1] in b'/.':
+    if refname[-1] in '/.':
         return False
-    if refname.endswith(b'.lock'):
+    if refname.endswith('.lock'):
         return False
-    if b'@{' in refname:
+    if '@{' in refname:
         return False
-    if b'\\' in refname:
+    if '\\' in refname:
         return False
     return True
 
@@ -108,8 +104,8 @@ class RefsContainer(object):
         return None
 
     def import_refs(self, base, other):
-        for name, value in other.items():
-            self[b'/'.join((base, name))] = value
+        for name, value in other.iteritems():
+            self["%s/%s" % (base, name)] = value
 
     def allkeys(self):
         """All refs present in this container."""
@@ -148,12 +144,10 @@ class RefsContainer(object):
         ret = {}
         keys = self.keys(base)
         if base is None:
-            base = b''
-        else:
-            base = base.rstrip(b'/')
+            base = ""
         for key in keys:
             try:
-                ret[key] = self[(base + b'/' + key).strip(b'/')]
+                ret[key] = self[("%s/%s" % (base, key)).strip("/")]
             except KeyError:
                 continue  # Unable to resolve
 
@@ -170,9 +164,9 @@ class RefsContainer(object):
         :param name: The name of the reference.
         :raises KeyError: if a refname is not HEAD or is otherwise not valid.
         """
-        if name in (b'HEAD', b'refs/stash'):
+        if name in ('HEAD', 'refs/stash'):
             return
-        if not name.startswith(b'refs/') or not check_ref_format(name[5:]):
+        if not name.startswith('refs/') or not check_ref_format(name[5:]):
             raise RefFormatError(name)
 
     def read_ref(self, refname):
@@ -355,15 +349,15 @@ class InfoRefsContainer(RefsContainer):
         self._refs = {}
         self._peeled = {}
         for l in f.readlines():
-            sha, name = l.rstrip(b'\n').split(b'\t')
-            if name.endswith(b'^{}'):
+            sha, name = l.rstrip("\n").split("\t")
+            if name.endswith("^{}"):
                 name = name[:-3]
                 if not check_ref_format(name):
-                    raise ValueError("invalid ref name %r" % name)
+                    raise ValueError("invalid ref name '%s'" % name)
                 self._peeled[name] = sha
             else:
                 if not check_ref_format(name):
-                    raise ValueError("invalid ref name %r" % name)
+                    raise ValueError("invalid ref name '%s'" % name)
                 self._refs[name] = sha
 
     def allkeys(self):
@@ -394,42 +388,39 @@ class DiskRefsContainer(RefsContainer):
         return "%s(%r)" % (self.__class__.__name__, self.path)
 
     def subkeys(self, base):
-        subkeys = set()
+        keys = set()
         path = self.refpath(base)
         for root, dirs, files in os.walk(path):
             dir = root[len(path):].strip(os.path.sep).replace(os.path.sep, "/")
             for filename in files:
-                refname = (("%s/%s" % (dir, filename))
-                           .strip("/").encode(sys.getfilesystemencoding()))
+                refname = ("%s/%s" % (dir, filename)).strip("/")
                 # check_ref_format requires at least one /, so we prepend the
                 # base before calling it.
-                if check_ref_format(base + b'/' + refname):
-                    subkeys.add(refname)
+                if check_ref_format("%s/%s" % (base, refname)):
+                    keys.add(refname)
         for key in self.get_packed_refs():
             if key.startswith(base):
-                subkeys.add(key[len(base):].strip(b'/'))
-        return subkeys
+                keys.add(key[len(base):].strip("/"))
+        return keys
 
     def allkeys(self):
-        allkeys = set()
-        if os.path.exists(self.refpath(b'HEAD')):
-            allkeys.add(b'HEAD')
-        path = self.refpath(b'')
-        for root, dirs, files in os.walk(self.refpath(b'refs')):
+        keys = set()
+        if os.path.exists(self.refpath("HEAD")):
+            keys.add("HEAD")
+        path = self.refpath("")
+        for root, dirs, files in os.walk(self.refpath("refs")):
             dir = root[len(path):].strip(os.path.sep).replace(os.path.sep, "/")
             for filename in files:
-                refname = ("%s/%s" % (dir, filename)).encode(sys.getfilesystemencoding())
+                refname = ("%s/%s" % (dir, filename)).strip("/")
                 if check_ref_format(refname):
-                    allkeys.add(refname)
-        allkeys.update(self.get_packed_refs())
-        return allkeys
+                    keys.add(refname)
+        keys.update(self.get_packed_refs())
+        return keys
 
     def refpath(self, name):
         """Return the disk path of a ref.
 
         """
-        if getattr(self.path, "encode", None) and getattr(name, "decode", None):
-            name = name.decode(sys.getfilesystemencoding())
         if os.path.sep != "/":
             name = name.replace("/", os.path.sep)
         return os.path.join(self.path, name)
@@ -455,9 +446,9 @@ class DiskRefsContainer(RefsContainer):
                 if e.errno == errno.ENOENT:
                     return {}
                 raise
-            with f:
+            try:
                 first_line = next(iter(f)).rstrip()
-                if (first_line.startswith(b'# pack-refs') and b' peeled' in
+                if (first_line.startswith("# pack-refs") and " peeled" in
                         first_line):
                     for sha, name, peeled in read_packed_refs_with_peeled(f):
                         self._packed_refs[name] = sha
@@ -467,6 +458,8 @@ class DiskRefsContainer(RefsContainer):
                     f.seek(0)
                     for sha, name in read_packed_refs(f):
                         self._packed_refs[name] = sha
+            finally:
+                f.close()
         return self._packed_refs
 
     def get_peeled(self, name):
@@ -500,14 +493,17 @@ class DiskRefsContainer(RefsContainer):
         """
         filename = self.refpath(name)
         try:
-            with GitFile(filename, 'rb') as f:
+            f = GitFile(filename, 'rb')
+            try:
                 header = f.read(len(SYMREF))
                 if header == SYMREF:
                     # Read only the first line
-                    return header + next(iter(f)).rstrip(b'\r\n')
+                    return header + next(iter(f)).rstrip("\r\n")
                 else:
                     # Read only the first 40 bytes
                     return header + f.read(40 - len(SYMREF))
+            finally:
+                f.close()
         except IOError as e:
             if e.errno == errno.ENOENT:
                 return None
@@ -546,7 +542,7 @@ class DiskRefsContainer(RefsContainer):
         try:
             f = GitFile(filename, 'wb')
             try:
-                f.write(SYMREF + other + b'\n')
+                f.write(SYMREF + other + '\n')
             except (IOError, OSError):
                 f.abort()
                 raise
@@ -572,7 +568,8 @@ class DiskRefsContainer(RefsContainer):
             realname = name
         filename = self.refpath(realname)
         ensure_dir_exists(os.path.dirname(filename))
-        with GitFile(filename, 'wb') as f:
+        f = GitFile(filename, 'wb')
+        try:
             if old_ref is not None:
                 try:
                     # read again while holding the lock
@@ -586,10 +583,12 @@ class DiskRefsContainer(RefsContainer):
                     f.abort()
                     raise
             try:
-                f.write(new_ref + b'\n')
+                f.write(new_ref + "\n")
             except (OSError, IOError):
                 f.abort()
                 raise
+        finally:
+            f.close()
         return True
 
     def add_if_new(self, name, ref):
@@ -611,15 +610,18 @@ class DiskRefsContainer(RefsContainer):
         self._check_refname(realname)
         filename = self.refpath(realname)
         ensure_dir_exists(os.path.dirname(filename))
-        with GitFile(filename, 'wb') as f:
+        f = GitFile(filename, 'wb')
+        try:
             if os.path.exists(filename) or name in self.get_packed_refs():
                 f.abort()
                 return False
             try:
-                f.write(ref + b'\n')
+                f.write(ref + "\n")
             except (OSError, IOError):
                 f.abort()
                 raise
+        finally:
+            f.close()
         return True
 
     def remove_if_equals(self, name, old_ref):
@@ -659,14 +661,16 @@ class DiskRefsContainer(RefsContainer):
 
 def _split_ref_line(line):
     """Split a single ref line into a tuple of SHA1 and name."""
-    fields = line.rstrip(b'\n').split(b' ')
+    fields = line.rstrip("\n").split(" ")
     if len(fields) != 2:
-        raise PackedRefsException("invalid ref line %r" % line)
+        raise PackedRefsException("invalid ref line '%s'" % line)
     sha, name = fields
-    if not valid_hexsha(sha):
-        raise PackedRefsException("Invalid hex sha %r" % sha)
+    try:
+        hex_to_sha(sha)
+    except (AssertionError, TypeError) as e:
+        raise PackedRefsException(e)
     if not check_ref_format(name):
-        raise PackedRefsException("invalid ref name %r" % name)
+        raise PackedRefsException("invalid ref name '%s'" % name)
     return (sha, name)
 
 
@@ -677,10 +681,10 @@ def read_packed_refs(f):
     :return: Iterator over tuples with SHA1s and ref names.
     """
     for l in f:
-        if l.startswith(b'#'):
+        if l[0] == "#":
             # Comment
             continue
-        if l.startswith(b'^'):
+        if l[0] == "^":
             raise PackedRefsException(
               "found peeled ref in packed-refs without peeled")
         yield _split_ref_line(l)
@@ -696,14 +700,16 @@ def read_packed_refs_with_peeled(f):
     """
     last = None
     for l in f:
-        if l[0] == b'#':
+        if l[0] == "#":
             continue
-        l = l.rstrip(b'\r\n')
-        if l.startswith(b'^'):
+        l = l.rstrip("\r\n")
+        if l[0] == "^":
             if not last:
                 raise PackedRefsException("unexpected peeled ref line")
-            if not valid_hexsha(l[1:]):
-                raise PackedRefsException("Invalid hex sha %r" % l[1:])
+            try:
+                hex_to_sha(l[1:])
+            except (AssertionError, TypeError) as e:
+                raise PackedRefsException(e)
             sha, name = _split_ref_line(last)
             last = None
             yield (sha, name, l[1:])
@@ -727,11 +733,11 @@ def write_packed_refs(f, packed_refs, peeled_refs=None):
     if peeled_refs is None:
         peeled_refs = {}
     else:
-        f.write(b'# pack-refs with: peeled\n')
-    for refname in sorted(packed_refs.keys()):
-        f.write(git_line(packed_refs[refname], refname))
+        f.write('# pack-refs with: peeled\n')
+    for refname in sorted(packed_refs.iterkeys()):
+        f.write('%s %s\n' % (packed_refs[refname], refname))
         if refname in peeled_refs:
-            f.write(b'^' + peeled_refs[refname] + b'\n')
+            f.write('^%s\n' % peeled_refs[refname])
 
 
 def read_info_refs(f):
@@ -747,16 +753,13 @@ def write_info_refs(refs, store):
     for name, sha in sorted(refs.items()):
         # get_refs() includes HEAD as a special case, but we don't want to
         # advertise it
-        if name == b'HEAD':
+        if name == 'HEAD':
             continue
         try:
             o = store[sha]
         except KeyError:
             continue
         peeled = store.peel_sha(sha)
-        yield o.id + b'\t' + name + b'\n'
+        yield '%s\t%s\n' % (o.id, name)
         if o.id != peeled.id:
-            yield peeled.id + b'\t' + name + b'^{}\n'
-
-
-is_local_branch = lambda x: x.startswith(b'refs/heads/')
+            yield '%s\t%s^{}\n' % (peeled.id, name)

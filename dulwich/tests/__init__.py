@@ -27,12 +27,13 @@ import sys
 import tempfile
 
 
-# If Python itself provides an exception, use that
-import unittest
-if sys.version_info < (2, 7):
-    from unittest2 import SkipTest, TestCase as _TestCase, skipIf, expectedFailure
+if sys.version_info >= (2, 7):
+    # If Python itself provides an exception, use that
+    import unittest
+    from unittest import SkipTest, TestCase as _TestCase
 else:
-    from unittest import SkipTest, TestCase as _TestCase, skipIf, expectedFailure
+    import unittest2 as unittest
+    from unittest2 import SkipTest, TestCase as _TestCase
 
 
 def get_safe_env(env=None):
@@ -75,9 +76,8 @@ class TestCase(_TestCase):
 class BlackboxTestCase(TestCase):
     """Blackbox testing."""
 
-    # TODO(jelmer): Include more possible binary paths.
-    bin_directories = [os.path.abspath(os.path.join(os.path.dirname(__file__),
-        "..", "..", "bin")), '/usr/bin', '/usr/local/bin']
+    bin_directory = os.path.abspath(os.path.join(os.path.dirname(__file__),
+        "..", "..", "bin"))
 
     def bin_path(self, name):
         """Determine the full path of a binary.
@@ -85,12 +85,7 @@ class BlackboxTestCase(TestCase):
         :param name: Name of the script
         :return: Full path
         """
-        for d in self.bin_directories:
-            p = os.path.join(d, name)
-            if os.path.isfile(p):
-                return p
-        else:
-            raise SkipTest("Unable to find binary %s" % name)
+        return os.path.join(self.bin_directory, name)
 
     def run_command(self, name, args):
         """Run a Dulwich command.
@@ -110,32 +105,27 @@ class BlackboxTestCase(TestCase):
         return subprocess.Popen(argv,
             stdout=subprocess.PIPE,
             stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             env=env)
 
 
 def self_test_suite():
     names = [
-        'archive',
         'blackbox',
         'client',
         'config',
         'diff_tree',
         'fastexport',
         'file',
-        'grafts',
-        'greenthreads',
         'hooks',
         'index',
         'lru_cache',
         'objects',
-        'objectspec',
         'object_store',
         'missing_obj_finder',
         'pack',
         'patch',
-        'porcelain',
         'protocol',
-        'refs',
         'repository',
         'server',
         'walk',
@@ -149,7 +139,6 @@ def self_test_suite():
 def tutorial_test_suite():
     tutorial = [
         'introduction',
-        'file-format',
         'repo',
         'object-store',
         'remote',
@@ -170,10 +159,7 @@ def tutorial_test_suite():
 def nocompat_test_suite():
     result = unittest.TestSuite()
     result.addTests(self_test_suite())
-    from dulwich.contrib import test_suite as contrib_test_suite
-    if sys.version_info[0] == 2:
-        result.addTests(tutorial_test_suite())
-    result.addTests(contrib_test_suite())
+    result.addTests(tutorial_test_suite())
     return result
 
 
@@ -187,10 +173,7 @@ def compat_test_suite():
 def test_suite():
     result = unittest.TestSuite()
     result.addTests(self_test_suite())
-    if sys.version_info[0] == 2 and sys.platform != 'win32':
-        result.addTests(tutorial_test_suite())
+    result.addTests(tutorial_test_suite())
     from dulwich.tests.compat import test_suite as compat_test_suite
     result.addTests(compat_test_suite())
-    from dulwich.contrib import test_suite as contrib_test_suite
-    result.addTests(contrib_test_suite())
     return result

@@ -23,9 +23,8 @@ from dulwich.objects import (
     Blob,
     )
 from dulwich.tests import TestCase
-from dulwich.tests.utils import (
+from utils import (
     make_object,
-    make_tag,
     build_commit_graph,
     )
 
@@ -46,7 +45,7 @@ class MissingObjectFinderTest(TestCase):
                 "(%s,%s) erroneously reported as missing" % (sha, path))
             expected.remove(sha)
 
-        self.assertEqual(len(expected), 0,
+        self.assertEquals(len(expected), 0,
             "some objects are not reported as missing: %s" % (expected, ))
 
 
@@ -54,16 +53,16 @@ class MOFLinearRepoTest(MissingObjectFinderTest):
 
     def setUp(self):
         super(MOFLinearRepoTest, self).setUp()
-        f1_1 = make_object(Blob, data=b'f1') # present in 1, removed in 3
-        f2_1 = make_object(Blob, data=b'f2') # present in all revisions, changed in 2 and 3
-        f2_2 = make_object(Blob, data=b'f2-changed')
-        f2_3 = make_object(Blob, data=b'f2-changed-again')
-        f3_2 = make_object(Blob, data=b'f3') # added in 2, left unmodified in 3
+        f1_1 = make_object(Blob, data='f1') # present in 1, removed in 3
+        f2_1 = make_object(Blob, data='f2') # present in all revisions, changed in 2 and 3
+        f2_2 = make_object(Blob, data='f2-changed')
+        f2_3 = make_object(Blob, data='f2-changed-again')
+        f3_2 = make_object(Blob, data='f3') # added in 2, left unmodified in 3
 
         commit_spec = [[1], [2, 1], [3, 2]]
-        trees = {1: [(b'f1', f1_1), (b'f2', f2_1)],
-                 2: [(b'f1', f1_1), (b'f2', f2_2), (b'f3', f3_2)],
-                 3: [(b'f2', f2_3), (b'f3', f3_2)] }
+        trees = {1: [('f1', f1_1), ('f2', f2_1)],
+                2: [('f1', f1_1), ('f2', f2_2), ('f3', f3_2)],
+                3: [('f2', f2_3), ('f3', f3_2)] }
         # commit 1: f1 and f2
         # commit 2: f3 added, f2 changed. Missing shall report commit id and a
         # tree referenced by commit
@@ -89,12 +88,13 @@ class MOFLinearRepoTest(MissingObjectFinderTest):
         self.assertMissingMatch([self.cmt(1).id], [self.cmt(3).id],
             self.missing_1_3)
 
-    def test_bogus_haves(self):
-        """Ensure non-existent SHA in haves are tolerated"""
+    def test_bogus_haves_failure(self):
+        """Ensure non-existent SHA in haves are not tolerated"""
         bogus_sha = self.cmt(2).id[::-1]
         haves = [self.cmt(1).id, bogus_sha]
         wants = [self.cmt(3).id]
-        self.assertMissingMatch(haves, wants, self.missing_1_3)
+        self.assertRaises(KeyError, self.store.find_missing_objects,
+            self.store, haves, wants)
 
     def test_bogus_wants_failure(self):
         """Ensure non-existent SHA in wants are not tolerated"""
@@ -102,7 +102,7 @@ class MOFLinearRepoTest(MissingObjectFinderTest):
         haves = [self.cmt(1).id]
         wants = [self.cmt(3).id, bogus_sha]
         self.assertRaises(KeyError, self.store.find_missing_objects,
-            haves, wants)
+            self.store, haves, wants)
 
     def test_no_changes(self):
         self.assertMissingMatch([self.cmt(3).id], [self.cmt(3).id], [])
@@ -117,24 +117,24 @@ class MOFMergeForkRepoTest(MissingObjectFinderTest):
 
     def setUp(self):
         super(MOFMergeForkRepoTest, self).setUp()
-        f1_1 = make_object(Blob, data=b'f1')
-        f1_2 = make_object(Blob, data=b'f1-2')
-        f1_4 = make_object(Blob, data=b'f1-4')
-        f1_7 = make_object(Blob, data=b'f1-2') # same data as in rev 2
-        f2_1 = make_object(Blob, data=b'f2')
-        f2_3 = make_object(Blob, data=b'f2-3')
-        f3_3 = make_object(Blob, data=b'f3')
-        f3_5 = make_object(Blob, data=b'f3-5')
+        f1_1 = make_object(Blob, data='f1')
+        f1_2 = make_object(Blob, data='f1-2')
+        f1_4 = make_object(Blob, data='f1-4')
+        f1_7 = make_object(Blob, data='f1-2') # same data as in rev 2
+        f2_1 = make_object(Blob, data='f2')
+        f2_3 = make_object(Blob, data='f2-3')
+        f3_3 = make_object(Blob, data='f3')
+        f3_5 = make_object(Blob, data='f3-5')
         commit_spec = [[1], [2, 1], [3, 2], [4, 2], [5, 3], [6, 3, 4], [7, 6]]
-        trees = {1: [(b'f1', f1_1), (b'f2', f2_1)],
-                2: [(b'f1', f1_2), (b'f2', f2_1)], # f1 changed
+        trees = {1: [('f1', f1_1), ('f2', f2_1)],
+                2: [('f1', f1_2), ('f2', f2_1)], # f1 changed
                 # f3 added, f2 changed
-                3: [(b'f1', f1_2), (b'f2', f2_3), (b'f3', f3_3)],
-                4: [(b'f1', f1_4), (b'f2', f2_1)],  # f1 changed
-                5: [(b'f1', f1_2), (b'f3', f3_5)], # f2 removed, f3 changed
-                6: [(b'f1', f1_4), (b'f2', f2_3), (b'f3', f3_3)], # merged 3 and 4
+                3: [('f1', f1_2), ('f2', f2_3), ('f3', f3_3)],
+                4: [('f1', f1_4), ('f2', f2_1)],  # f1 changed
+                5: [('f1', f1_2), ('f3', f3_5)], # f2 removed, f3 changed
+                6: [('f1', f1_4), ('f2', f2_3), ('f3', f3_3)], # merged 3 and 4
                 # f1 changed to match rev2. f3 removed
-                7: [(b'f1', f1_7), (b'f2', f2_3)]}
+                7: [('f1', f1_7), ('f2', f2_3)]}
         self.commits = build_commit_graph(self.store, commit_spec, trees)
 
         self.f1_2_id = f1_2.id
@@ -143,7 +143,7 @@ class MOFMergeForkRepoTest(MissingObjectFinderTest):
         self.f2_3_id = f2_3.id
         self.f3_3_id = f3_3.id
 
-        self.assertEqual(f1_2.id, f1_7.id, "[sanity]")
+        self.assertEquals(f1_2.id, f1_7.id, "[sanity]")
 
     def test_have6_want7(self):
         # have 6, want 7. Ideally, shall not report f1_7 as it's the same as
@@ -191,59 +191,3 @@ class MOFMergeForkRepoTest(MissingObjectFinderTest):
               self.cmt(7).id, self.cmt(6).id, self.cmt(4).id,
               self.cmt(7).tree, self.cmt(6).tree, self.cmt(4).tree,
               self.f1_4_id])
-
-
-class MOFTagsTest(MissingObjectFinderTest):
-
-    def setUp(self):
-        super(MOFTagsTest, self).setUp()
-        f1_1 = make_object(Blob, data=b'f1')
-        commit_spec = [[1]]
-        trees = {1: [(b'f1', f1_1)]}
-        self.commits = build_commit_graph(self.store, commit_spec, trees)
-
-        self._normal_tag = make_tag(self.cmt(1))
-        self.store.add_object(self._normal_tag)
-
-        self._tag_of_tag = make_tag(self._normal_tag)
-        self.store.add_object(self._tag_of_tag)
-
-        self._tag_of_tree = make_tag(self.store[self.cmt(1).tree])
-        self.store.add_object(self._tag_of_tree)
-
-        self._tag_of_blob = make_tag(f1_1)
-        self.store.add_object(self._tag_of_blob)
-
-        self._tag_of_tag_of_blob = make_tag(self._tag_of_blob)
-        self.store.add_object(self._tag_of_tag_of_blob)
-
-        self.f1_1_id = f1_1.id
-
-    def test_tagged_commit(self):
-        # The user already has the tagged commit, all they want is the tag,
-        # so send them only the tag object.
-        self.assertMissingMatch([self.cmt(1).id], [self._normal_tag.id],
-                                [self._normal_tag.id])
-
-    # The remaining cases are unusual, but do happen in the wild.
-    def test_tagged_tag(self):
-        # User already has tagged tag, send only tag of tag
-        self.assertMissingMatch([self._normal_tag.id], [self._tag_of_tag.id],
-                                [self._tag_of_tag.id])
-        # User needs both tags, but already has commit
-        self.assertMissingMatch([self.cmt(1).id], [self._tag_of_tag.id],
-                                [self._normal_tag.id, self._tag_of_tag.id])
-
-    def test_tagged_tree(self):
-        self.assertMissingMatch(
-            [], [self._tag_of_tree.id],
-            [self._tag_of_tree.id, self.cmt(1).tree, self.f1_1_id])
-
-    def test_tagged_blob(self):
-        self.assertMissingMatch([], [self._tag_of_blob.id],
-                                [self._tag_of_blob.id, self.f1_1_id])
-
-    def test_tagged_tagged_blob(self):
-        self.assertMissingMatch([], [self._tag_of_tag_of_blob.id],
-                                [self._tag_of_tag_of_blob.id,
-                                 self._tag_of_blob.id, self.f1_1_id])

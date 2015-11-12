@@ -23,11 +23,9 @@
 import datetime
 import os
 import shutil
-import sys
 import tempfile
 import time
 import types
-
 import warnings
 
 from dulwich.index import (
@@ -36,8 +34,6 @@ from dulwich.index import (
 from dulwich.objects import (
     FixedSha,
     Commit,
-    Tag,
-    object_class,
     )
 from dulwich.pack import (
     OFS_DELTA,
@@ -52,15 +48,13 @@ from dulwich.pack import (
 from dulwich.repo import Repo
 from dulwich.tests import (
     SkipTest,
-    skipIf,
     )
 
-
 # Plain files are very frequently used in tests, so let the mode be very short.
-F = 0o100644  # Shorthand mode for Files.
+F = 0100644  # Shorthand mode for Files.
 
 
-def open_repo(name, temp_dir=None):
+def open_repo(name):
     """Open a copy of a repo in a temporary directory.
 
     Use this function for accessing repos in dulwich/tests/data/repos to avoid
@@ -69,12 +63,9 @@ def open_repo(name, temp_dir=None):
 
     :param name: The name of the repository, relative to
         dulwich/tests/data/repos
-    :param temp_dir: temporary directory to initialize to. If not provided, a
-        temporary directory will be created.
     :returns: An initialized Repo object that lives in a temporary directory.
     """
-    if temp_dir is None:
-        temp_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp()
     repo_dir = os.path.join(os.path.dirname(__file__), 'data', 'repos', name)
     temp_repo_dir = os.path.join(temp_dir, name)
     shutil.copytree(repo_dir, temp_repo_dir, symlinks=True)
@@ -83,7 +74,6 @@ def open_repo(name, temp_dir=None):
 
 def tear_down_repo(repo):
     """Tear down a test repository."""
-    repo.close()
     temp_dir = os.path.dirname(repo.path.rstrip(os.sep))
     shutil.rmtree(temp_dir)
 
@@ -106,10 +96,9 @@ def make_object(cls, **attrs):
         __dict__ instead of __slots__.
         """
         pass
-    TestObject.__name__ = 'TestObject_' + cls.__name__
 
     obj = TestObject()
-    for name, value in attrs.items():
+    for name, value in attrs.iteritems():
         if name == 'id':
             # id property is read-only, so we overwrite sha instead.
             sha = FixedSha(value)
@@ -126,38 +115,17 @@ def make_commit(**attrs):
     :return: A newly initialized Commit object.
     """
     default_time = int(time.mktime(datetime.datetime(2010, 1, 1).timetuple()))
-    all_attrs = {'author': b'Test Author <test@nodomain.com>',
+    all_attrs = {'author': 'Test Author <test@nodomain.com>',
                  'author_time': default_time,
                  'author_timezone': 0,
-                 'committer': b'Test Committer <test@nodomain.com>',
+                 'committer': 'Test Committer <test@nodomain.com>',
                  'commit_time': default_time,
                  'commit_timezone': 0,
-                 'message': b'Test message.',
+                 'message': 'Test message.',
                  'parents': [],
-                 'tree': b'0' * 40}
+                 'tree': '0' * 40}
     all_attrs.update(attrs)
     return make_object(Commit, **all_attrs)
-
-
-def make_tag(target, **attrs):
-    """Make a Tag object with a default set of values.
-
-    :param target: object to be tagged (Commit, Blob, Tree, etc)
-    :param attrs: dict of attributes to overwrite from the default values.
-    :return: A newly initialized Tag object.
-    """
-    target_id = target.id
-    target_type = object_class(target.type_name)
-    default_time = int(time.mktime(datetime.datetime(2010, 1, 1).timetuple()))
-    all_attrs = {'tagger': b'Test Author <test@nodomain.com>',
-                 'tag_time': default_time,
-                 'tag_timezone': 0,
-                 'message': b'Test message.',
-                 'object': (target_type, target_id),
-                 'name': b'Test Tag',
-                 }
-    all_attrs.update(attrs)
-    return make_object(Tag, **all_attrs)
 
 
 def functest_builder(method, func):
@@ -192,7 +160,7 @@ def ext_functest_builder(method, func):
 
     def do_test(self):
         if not isinstance(func, types.BuiltinFunctionType):
-            raise SkipTest("%s extension not found" % func)
+            raise SkipTest("%s extension not found" % func.func_name)
         method(self, func)
 
     return do_test
@@ -261,7 +229,7 @@ def build_pack(f, objects_spec, store=None):
         crc32s[i] = crc32
 
     expected = []
-    for i in range(num_objects):
+    for i in xrange(num_objects):
         type_num, data, sha = full_objects[i]
         assert len(sha) == 20
         expected.append((offsets[i], type_num, data, sha, crc32s[i]))
@@ -312,7 +280,7 @@ def build_commit_graph(object_store, commit_spec, trees=None, attrs=None):
         commit_num = commit[0]
         try:
             parent_ids = [nums[pn] for pn in commit[1:]]
-        except KeyError as e:
+        except KeyError, e:
             missing_parent, = e.args
             raise ValueError('Unknown parent %i' % missing_parent)
 
@@ -327,7 +295,7 @@ def build_commit_graph(object_store, commit_spec, trees=None, attrs=None):
         tree_id = commit_tree(object_store, blobs)
 
         commit_attrs = {
-            'message': ('Commit %i' % commit_num).encode('ascii'),
+            'message': 'Commit %i' % commit_num,
             'parents': parent_ids,
             'tree': tree_id,
             'commit_time': commit_time,
@@ -355,10 +323,4 @@ def setup_warning_catcher():
         caught_warnings.append(args[0])
 
     warnings.showwarning = custom_showwarning
-
-    def restore_showwarning():
-        warnings.showwarning = original_showwarning
-
-    return caught_warnings, restore_showwarning
-
-skipIfPY3 = skipIf(sys.version_info[0] == 3, "Feature not yet ported to python3.")
+    return caught_warnings

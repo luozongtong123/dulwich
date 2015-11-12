@@ -1,5 +1,4 @@
 # hooks.py -- for dealing with git hooks
-# Copyright (C) 2012-2013 Jelmer Vernooij and others.
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -20,8 +19,8 @@
 
 import os
 import subprocess
-import sys
 import tempfile
+import warnings
 
 from dulwich.errors import (
     HookError,
@@ -31,7 +30,7 @@ from dulwich.errors import (
 class Hook(object):
     """Generic hook object."""
 
-    def execute(self, *args):
+    def execute(elf, *args):
         """Execute the hook with the given args
 
         :param args: argument list to hook
@@ -72,18 +71,13 @@ class ShellHook(Hook):
         self.pre_exec_callback = pre_exec_callback
         self.post_exec_callback = post_exec_callback
 
-        if sys.version_info[0] == 2 and sys.platform == 'win32':
-            # Python 2 on windows does not support unicode file paths
-            # http://bugs.python.org/issue1759845
-            self.filepath = self.filepath.encode(sys.getfilesystemencoding())
-
     def execute(self, *args):
         """Execute the hook with given args"""
 
         if len(args) != self.numparam:
             raise HookError("Hook %s executed with wrong number of args. \
-                            Expected %d. Saw %d. args: %s"
-                            % (self.name, self.numparam, len(args), args))
+                            Expected %d. Saw %d. %s"
+                            % (self.name, self.numparam, len(args)))
 
         if (self.pre_exec_callback is not None):
             args = self.pre_exec_callback(*args)
@@ -133,8 +127,11 @@ class CommitMsgShellHook(ShellHook):
         def prepare_msg(*args):
             (fd, path) = tempfile.mkstemp()
 
-            with os.fdopen(fd, 'wb') as f:
+            f = os.fdopen(fd, 'wb')
+            try:
                 f.write(args[0])
+            finally:
+                f.close()
 
             return (path,)
 

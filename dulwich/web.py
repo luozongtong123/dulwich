@@ -1,6 +1,5 @@
 # web.py -- WSGI smart-http server
 # Copyright (C) 2010 Google, Inc.
-# Copyright (C) 2012 Jelmer Vernooij <jelmer@samba.org>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -19,27 +18,17 @@
 
 """HTTP server for dulwich that implements the git smart HTTP protocol."""
 
-from io import BytesIO
-import shutil
-import tempfile
+from cStringIO import StringIO
 import gzip
 import os
 import re
 import sys
 import time
-from wsgiref.simple_server import (
-    WSGIRequestHandler,
-    ServerHandler,
-    WSGIServer,
-    make_server,
-    )
 
 try:
     from urlparse import parse_qs
 except ImportError:
-    from urllib.parse import parse_qs
-
-
+    from dulwich._compat import parse_qs
 from dulwich import log_utils
 from dulwich.protocol import (
     ReceivableProtocol,
@@ -139,7 +128,7 @@ def get_text_file(req, backend, mat):
 
 
 def get_loose_object(req, backend, mat):
-    sha = (mat.group(1) + mat.group(2)).encode('ascii')
+    sha = mat.group(1) + mat.group(2)
     logger.info('Sending loose object %s', sha)
     object_store = get_repo(backend, mat).object_store
     if not object_store.contains_loose(sha):
@@ -177,14 +166,14 @@ def get_info_refs(req, backend, mat):
     if service and not req.dumb:
         handler_cls = req.handlers.get(service, None)
         if handler_cls is None:
-            yield req.forbidden('Unsupported service')
+            yield req.forbidden('Unsupported service %s' % service)
             return
         req.nocache()
         write = req.respond(HTTP_OK, 'application/x-%s-advertisement' % service)
-        proto = ReceivableProtocol(BytesIO().read, write)
+        proto = ReceivableProtocol(StringIO().read, write)
         handler = handler_cls(backend, [url_prefix(mat)], proto,
                               http_req=req, advertise_refs=True)
-        handler.proto.write_pkt_line(b'# service=' + service.encode('ascii') + b'\n')
+        handler.proto.write_pkt_line('# service=%s\n' % service)
         handler.proto.write_pkt_line(None)
         handler.handle()
     else:
@@ -219,7 +208,7 @@ class _LengthLimitedFile(object):
 
     def read(self, size=-1):
         if self._bytes_avail <= 0:
-            return b''
+            return ''
         if size == -1 or size > self._bytes_avail:
             size = self._bytes_avail
         self._bytes_avail -= size
@@ -233,7 +222,7 @@ def handle_service_request(req, backend, mat):
     logger.info('Handling service request for %s', service)
     handler_cls = req.handlers.get(service, None)
     if handler_cls is None:
-        yield req.forbidden('Unsupported service')
+        yield req.forbidden('Unsupported service %s' % service)
         return
     req.nocache()
     write = req.respond(HTTP_OK, 'application/x-%s-result' % service)
@@ -344,7 +333,7 @@ class HTTPGitApplication(object):
                              handlers=self.handlers)
         # environ['QUERY_STRING'] has qs args
         handler = None
-        for smethod, spath in self.services.keys():
+        for smethod, spath in self.services.iterkeys():
             if smethod != method:
                 continue
             mat = spath.search(path)
@@ -371,22 +360,11 @@ class GunzipFilter(object):
 
     def __call__(self, environ, start_response):
         if environ.get('HTTP_CONTENT_ENCODING', '') == 'gzip':
-            if hasattr(environ['wsgi.input'], 'seek'):
-                wsgi_input = environ['wsgi.input']
-            else:
-                # The gzip implementation in the standard library of Python 2.x
-                # requires the '.seek()' and '.tell()' methods to be available
-                # on the input stream.  Read the data into a temporary file to
-                # work around this limitation.
-                wsgi_input = tempfile.SpooledTemporaryFile(16 * 1024 * 1024)
-                shutil.copyfileobj(environ['wsgi.input'], wsgi_input)
-                wsgi_input.seek(0)
-
-            environ['wsgi.input'] = gzip.GzipFile(filename=None, fileobj=wsgi_input, mode='r')
-            del environ['HTTP_CONTENT_ENCODING']
+            environ.pop('HTTP_CONTENT_ENCODING')
             if 'CONTENT_LENGTH' in environ:
                 del environ['CONTENT_LENGTH']
-
+            environ['wsgi.input'] = gzip.GzipFile(filename=None,
+                fileobj=environ['wsgi.input'], mode='r')
         return self.app(environ, start_response)
 
 
@@ -419,84 +397,86 @@ def make_wsgi_chain(*args, **kwargs):
     return wrapped_app
 
 
-class ServerHandlerLogger(ServerHandler):
-    """ServerHandler that uses dulwich's logger for logging exceptions."""
-
-    def log_exception(self, exc_info):
-        if sys.version < (2, 7):
-            logger.exception('Exception happened during processing of request')
-        else:
+# The reference server implementation is based on wsgiref, which is not
+# distributed with python 2.4. If wsgiref is not present, users will not be
+# able to use the HTTP server without a little extra work.
+try:
+    from wsgiref.simple_server import (
+        WSGIRequestHandler,
+        ServerHandler,
+        WSGIServer,
+        make_server,
+    )
+    class ServerHandlerLogger(ServerHandler):
+        """ServerHandler that uses dulwich's logger for logging exceptions."""
+        
+        def log_exception(self, exc_info):
             logger.exception('Exception happened during processing of request',
                              exc_info=exc_info)
 
-    def log_message(self, format, *args):
-        logger.info(format, *args)
+        def log_message(self, format, *args):
+            logger.info(format, *args)
 
-    def log_error(self, *args):
-        logger.error(*args)
+        def log_error(self, *args):
+            logger.error(*args)
 
+    class WSGIRequestHandlerLogger(WSGIRequestHandler):
+        """WSGIRequestHandler that uses dulwich's logger for logging exceptions."""
 
-class WSGIRequestHandlerLogger(WSGIRequestHandler):
-    """WSGIRequestHandler that uses dulwich's logger for logging exceptions."""
+        def log_exception(self, exc_info):
+            logger.exception('Exception happened during processing of request',
+                             exc_info=exc_info)
 
-    def log_exception(self, exc_info):
-        logger.exception('Exception happened during processing of request',
-                         exc_info=exc_info)
+        def log_message(self, format, *args):
+            logger.info(format, *args)
 
-    def log_message(self, format, *args):
-        logger.info(format, *args)
+        def log_error(self, *args):
+            logger.error(*args)
+        
+        def handle(self):
+            """Handle a single HTTP request"""
+    
+            self.raw_requestline = self.rfile.readline()
+            if not self.parse_request(): # An error code has been sent, just exit
+                return
+    
+            handler = ServerHandlerLogger(
+                self.rfile, self.wfile, self.get_stderr(), self.get_environ()
+            )
+            handler.request_handler = self      # backpointer for logging
+            handler.run(self.server.get_app())
+    
+    class WSGIServerLogger(WSGIServer):
+        def handle_error(self, request, client_address):
+            """Handle an error. """
+            logger.exception('Exception happened during processing of request from %s' % str(client_address))
 
-    def log_error(self, *args):
-        logger.error(*args)
+    def main(argv=sys.argv):
+        """Entry point for starting an HTTP git server."""
+        if len(argv) > 1:
+            gitdir = argv[1]
+        else:
+            gitdir = os.getcwd()
 
-    def handle(self):
-        """Handle a single HTTP request"""
+        # TODO: allow serving on other addresses/ports via command-line flag
+        listen_addr = ''
+        port = 8000
 
-        self.raw_requestline = self.rfile.readline()
-        if not self.parse_request(): # An error code has been sent, just exit
-            return
+        log_utils.default_logging_config()
+        backend = DictBackend({'/': Repo(gitdir)})
+        app = make_wsgi_chain(backend)
+        server = make_server(listen_addr, port, app,
+                             handler_class=WSGIRequestHandlerLogger,
+                             server_class=WSGIServerLogger)
+        logger.info('Listening for HTTP connections on %s:%d', listen_addr,
+                    port)
+        server.serve_forever()
 
-        handler = ServerHandlerLogger(
-            self.rfile, self.wfile, self.get_stderr(), self.get_environ()
-        )
-        handler.request_handler = self      # backpointer for logging
-        handler.run(self.server.get_app())
-
-
-class WSGIServerLogger(WSGIServer):
-
-    def handle_error(self, request, client_address):
-        """Handle an error. """
-        logger.exception('Exception happened during processing of request from %s' % str(client_address))
-
-
-def main(argv=sys.argv):
-    """Entry point for starting an HTTP git server."""
-    import optparse
-    parser = optparse.OptionParser()
-    parser.add_option("-l", "--listen_address", dest="listen_address",
-                      default="localhost",
-                      help="Binding IP address.")
-    parser.add_option("-p", "--port", dest="port", type=int,
-                      default=8000,
-                      help="Port to listen on.")
-    options, args = parser.parse_args(argv)
-
-    if len(args) > 1:
-        gitdir = args[1]
-    else:
-        gitdir = os.getcwd()
-
-    log_utils.default_logging_config()
-    backend = DictBackend({'/': Repo(gitdir)})
-    app = make_wsgi_chain(backend)
-    server = make_server(options.listen_address, options.port, app,
-                         handler_class=WSGIRequestHandlerLogger,
-                         server_class=WSGIServerLogger)
-    logger.info('Listening for HTTP connections on %s:%d',
-                options.listen_address, options.port)
-    server.serve_forever()
-
-
-if __name__ == '__main__':
-    main()
+except ImportError:
+    # No wsgiref found; don't provide the reference functionality, but leave
+    # the rest of the WSGI-based implementation.
+    def main(argv=sys.argv):
+        """Stub entry point for failing to start a server without wsgiref."""
+        sys.stderr.write(
+            'Sorry, the wsgiref module is required for dul-web.\n')
+        sys.exit(1)

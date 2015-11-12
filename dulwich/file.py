@@ -19,26 +19,24 @@
 """Safe access to git files."""
 
 import errno
-import io
 import os
-import sys
 import tempfile
 
 def ensure_dir_exists(dirname):
     """Ensure a directory exists, creating if necessary."""
     try:
         os.makedirs(dirname)
-    except OSError as e:
+    except OSError, e:
         if e.errno != errno.EEXIST:
             raise
 
 
-def _fancy_rename(oldname, newname):
+def fancy_rename(oldname, newname):
     """Rename file with temporary backup file to rollback if rename fails"""
     if not os.path.exists(newname):
         try:
             os.rename(oldname, newname)
-        except OSError:
+        except OSError, e:
             raise
         return
 
@@ -47,17 +45,17 @@ def _fancy_rename(oldname, newname):
         (fd, tmpfile) = tempfile.mkstemp(".tmp", prefix=oldname+".", dir=".")
         os.close(fd)
         os.remove(tmpfile)
-    except OSError:
+    except OSError, e:
         # either file could not be created (e.g. permission problem)
         # or could not be deleted (e.g. rude virus scanner)
         raise
     try:
         os.rename(newname, tmpfile)
-    except OSError:
+    except OSError, e:
         raise   # no rename occurred
     try:
         os.rename(oldname, newname)
-    except OSError:
+    except OSError, e:
         os.rename(tmpfile, newname)
         raise
     os.remove(tmpfile)
@@ -84,7 +82,7 @@ def GitFile(filename, mode='rb', bufsize=-1):
     if 'w' in mode:
         return _GitFile(filename, mode, bufsize)
     else:
-        return io.open(filename, mode, bufsize)
+        return file(filename, mode, bufsize)
 
 
 class _GitFile(object):
@@ -100,8 +98,8 @@ class _GitFile(object):
 
     PROXY_PROPERTIES = set(['closed', 'encoding', 'errors', 'mode', 'name',
                             'newlines', 'softspace'])
-    PROXY_METHODS = ('__iter__', 'flush', 'fileno', 'isatty', 'read',
-                     'readline', 'readlines', 'seek', 'tell',
+    PROXY_METHODS = ('__iter__', 'flush', 'fileno', 'isatty', 'next', 'read',
+                     'readline', 'readlines', 'xreadlines', 'seek', 'tell',
                      'truncate', 'write', 'writelines')
     def __init__(self, filename, mode, bufsize):
         self._filename = filename
@@ -125,7 +123,7 @@ class _GitFile(object):
         try:
             os.remove(self._lockfilename)
             self._closed = True
-        except OSError as e:
+        except OSError, e:
             # The file may have been removed already, which is ok.
             if e.errno != errno.ENOENT:
                 raise
@@ -148,20 +146,13 @@ class _GitFile(object):
         try:
             try:
                 os.rename(self._lockfilename, self._filename)
-            except OSError as e:
-                if sys.platform == 'win32' and e.errno == errno.EEXIST:
-                    # Windows versions prior to Vista don't support atomic renames
-                    _fancy_rename(self._lockfilename, self._filename)
-                else:
+            except OSError, e:
+                # Windows versions prior to Vista don't support atomic renames
+                if e.errno != errno.EEXIST:
                     raise
+                fancy_rename(self._lockfilename, self._filename)
         finally:
             self.abort()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
 
     def __getattr__(self, name):
         """Proxy property calls to the underlying file."""
